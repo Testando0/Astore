@@ -2,25 +2,52 @@
 // REDZIN MARKET — Full E-Commerce App
 // ============================================================
 
-// ─── IN-MEMORY STORE (fallback when localStorage is blocked) ──
-const _mem = {};
-function lsGet(k, def) {
+// ─── STORAGE: in-memory-first, localStorage as persistence ───
+// All reads/writes go through _store (in-memory object).
+// localStorage is synced as a best-effort persistence layer.
+// sessionStorage is replaced entirely with _session (in-memory).
+const _store = {};   // replaces localStorage
+const _session = {}; // replaces sessionStorage
+
+function stGet(k, def) {
+  if (k in _store) {
+    try { return JSON.parse(_store[k]) ?? def; } catch(e) { return def; }
+  }
+  // Try to hydrate from localStorage on first access
   try {
     const v = localStorage.getItem(k);
-    if (v !== null) { _mem[k] = v; return JSON.parse(v) ?? def; }
+    if (v !== null) { _store[k] = v; return JSON.parse(v) ?? def; }
   } catch(e) {}
-  try { return _mem[k] !== undefined ? JSON.parse(_mem[k]) : def; } catch(e) { return def; }
+  return def;
 }
-function lsSet(k, v) {
+function stSet(k, v) {
   const s = JSON.stringify(v);
-  _mem[k] = s;
+  _store[k] = s;
   try { localStorage.setItem(k, s); } catch(e) {}
+}
+function ssGet(k, def = null) {
+  if (k in _session) {
+    try { return JSON.parse(_session[k]) ?? def; } catch(e) { return def; }
+  }
+  try {
+    const v = sessionStorage.getItem(k);
+    if (v !== null) { _session[k] = v; return JSON.parse(v) ?? def; }
+  } catch(e) {}
+  return def;
+}
+function ssSet(k, v) {
+  _session[k] = JSON.stringify(v);
+  try { sessionStorage.setItem(k, JSON.stringify(v)); } catch(e) {}
+}
+function ssRemove(k) {
+  delete _session[k];
+  try { sessionStorage.removeItem(k); } catch(e) {}
 }
 
 // ─── DATABASE ────────────────────────────────────────────────
 const DB = {
-  get: (k, def = []) => lsGet(k, def),
-  set: (k, v) => lsSet(k, v),
+  get: (k, def = []) => stGet(k, def),
+  set: (k, v) => stSet(k, v),
   getUsers: () => DB.get('rm_users', []),
   setUsers: v => DB.set('rm_users', v),
   getProducts: () => DB.get('rm_products', []),
@@ -47,7 +74,7 @@ const DB = {
     const chats = DB.getChats();
     chats[roomId] = room;
     DB.setChats(chats);
-    // Trigger in-page chat update for other "users" in same session
+    // Trigger in-page chat update immediately (same tab, same memory)
     window.dispatchEvent(new CustomEvent('rm_chats_updated', { detail: { roomId } }));
   },
 };
@@ -96,7 +123,15 @@ function init() {
 
   if (DB.getProducts().length === 0) seedProducts();
 
-  state.user = DB.getCurrent();
+  // Load current user — always cross-reference with users array to get latest data (e.g. isSeller promotions)
+  const savedCurrent = DB.getCurrent();
+  if (savedCurrent) {
+    const freshUser = DB.getUsers().find(u => u.id === savedCurrent.id);
+    state.user = freshUser || savedCurrent;
+    if (freshUser) DB.setCurrent(freshUser); // refresh rm_current with latest
+  } else {
+    state.user = null;
+  }
   hashRoute();
   window.addEventListener('hashchange', hashRoute);
   renderNav();
@@ -110,12 +145,18 @@ function init() {
     }
     if (state.user) checkUnreadBadges();
   });
-  // Also listen to cross-tab storage events as fallback
+  // Also listen to cross-tab storage events (another browser tab)
   window.addEventListener('storage', (e) => {
+    if (e.key && e.newValue !== null) {
+      // Invalidate in-memory cache so next read picks up the fresh value from localStorage
+      _store[e.key] = e.newValue;
+    }
     if (e.key === 'rm_chats') {
-      try { if (e.newValue) _mem['rm_chats'] = e.newValue; } catch(ex) {}
       if (chatState.open && chatState.roomId) renderChatMessages();
       if (state.user) checkUnreadBadges();
+    }
+    if (e.key === 'rm_notifs' && state.user) {
+      renderNav();
     }
   });
 
@@ -738,7 +779,7 @@ function applyCoupon(productId, sellerId) {
   if (coupon.uses >= coupon.maxUses) { result.innerHTML = `<div class="payment-status failed" style="font-size:12px">Cupom esgotado</div>`; return; }
   result.innerHTML = `<div class="payment-status confirmed" style="font-size:12px">✓ Cupom válido: ${coupon.discount}% de desconto!</div>`;
   toast(`Cupom ${code} aplicado!`, 'success');
-  sessionStorage.setItem('applied_coupon', JSON.stringify({ code, discount: coupon.discount, sellerId, couponId: coupon.id }));
+  ssSet('applied_coupon', { code, discount: coupon.discount, sellerId, couponId: coupon.id });
 }
 
 // ─── MY CHATS PAGE ───────────────────────────────────────────
@@ -850,10 +891,11 @@ function doLogin() {
   const user = document.getElementById('login-user')?.value?.trim();
   const pass = document.getElementById('login-pass')?.value;
   if (!user || !pass) { toast('Preencha todos os campos', 'error'); return; }
+  // Always read fresh from users array (not from rm_current which may be stale)
   const u = DB.getUsers().find(u => u.username === user && u.password === pass);
   if (!u) { toast('Usuário ou senha incorretos', 'error'); return; }
   state.user = u;
-  DB.setCurrent(u);
+  DB.setCurrent(u); // update rm_current with latest data
   closeModal();
   toast(`Bem-vindo, ${u.username}!`, 'success');
   render();
@@ -1310,14 +1352,14 @@ function toggleFav(productId) {
 function checkoutCart() {
   const cartItems = DB.getCart().filter(c => c.userId === state.user.id);
   if (cartItems.length === 0) return;
-  sessionStorage.setItem('checkout_cart', JSON.stringify(cartItems));
+  ssSet('checkout_cart', cartItems);
   navigate('checkout', { id: 'cart' });
 }
 
 function buyNow(productId) {
   if (!state.user) { showLogin(); return; }
   const qty = parseInt(document.getElementById('qty-input')?.value) || 1;
-  sessionStorage.setItem('buy_now', JSON.stringify({ productId, quantity: qty }));
+  ssSet('buy_now', { productId, quantity: qty });
   navigate('checkout', { id: productId });
 }
 
@@ -1325,13 +1367,13 @@ function buyNow(productId) {
 function renderCheckout() {
   if (!state.user) { showLogin(); return ''; }
   const isCart = state.params.id === 'cart';
-  const cartItems = isCart ? JSON.parse(sessionStorage.getItem('checkout_cart') || '[]') : null;
-  const buyNowData = !isCart ? JSON.parse(sessionStorage.getItem('buy_now') || 'null') : null;
+  const cartItems = isCart ? ssGet('checkout_cart', []) : null;
+  const buyNowData = !isCart ? ssGet('buy_now', null) : null;
 
   let items = [];
   let total = 0;
   const products = DB.getProducts();
-  const coupon = JSON.parse(sessionStorage.getItem('applied_coupon') || 'null');
+  const coupon = ssGet('applied_coupon', null);
 
   if (isCart && cartItems) {
     items = cartItems.map(c => {
@@ -1440,7 +1482,7 @@ function placeOrder() {
     neighborhood: document.getElementById('co-neighborhood')?.value || '',
     complement: document.getElementById('co-complement')?.value || '' };
 
-  const coupon = JSON.parse(sessionStorage.getItem('applied_coupon') || 'null');
+  const coupon = ssGet('applied_coupon', null);
   const products = DB.getProducts();
   const orders = DB.getOrders();
   let firstOrderId = null;
@@ -1481,9 +1523,9 @@ function placeOrder() {
   });
 
   DB.setOrders(orders);
-  sessionStorage.removeItem('applied_coupon');
-  sessionStorage.removeItem('buy_now');
-  sessionStorage.removeItem('checkout_cart');
+  ssRemove('applied_coupon');
+  ssRemove('buy_now');
+  ssRemove('checkout_cart');
   DB.setCart(DB.getCart().filter(c => c.userId !== state.user.id || !itemsData.find(i => i.id === c.productId)));
 
   _pendingOrderData = null;
@@ -2096,6 +2138,11 @@ function promoteSeller(userId) {
   if (idx < 0) return;
   users[idx].isSeller = true;
   DB.setUsers(users);
+  // If this is the currently logged-in user, update their session too
+  if (state.user && state.user.id === userId) {
+    state.user = { ...state.user, isSeller: true };
+    DB.setCurrent(state.user);
+  }
   const notifs = DB.getNotifs();
   notifs.push({ id: uid(), userId, type: 'promotion', message: '🎉 Parabéns! Você foi promovido a vendedor no REDZIN MARKET!', read: false, createdAt: new Date().toISOString() });
   DB.setNotifs(notifs);
@@ -2110,6 +2157,11 @@ function demoteSeller(userId) {
   if (idx < 0) return;
   users[idx].isSeller = false;
   DB.setUsers(users);
+  // If this is the currently logged-in user, update their session too
+  if (state.user && state.user.id === userId) {
+    state.user = { ...state.user, isSeller: false };
+    DB.setCurrent(state.user);
+  }
   toast('Status removido', 'info');
   render();
 }
