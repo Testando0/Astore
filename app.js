@@ -1,5 +1,5 @@
 // ============================================================
-// REDZIN MARKET — Full E-Commerce App
+// REDZIN MARKET — Full E-Commerce App with WebSocket Chat
 // ============================================================
 
 // ─── DATABASE (localStorage) ─────────────────────────────────
@@ -22,6 +22,27 @@ const DB = {
   setNotifs: v => DB.set('rm_notifs', v),
   getCurrent: () => DB.get('rm_current', null),
   setCurrent: v => DB.set('rm_current', v),
+  // ── CHAT ──
+  getChats: () => DB.get('rm_chats', {}),
+  setChats: v => DB.set('rm_chats', v),
+  getChatRoom: (roomId) => {
+    const chats = DB.getChats();
+    return chats[roomId] || { messages: [], participants: [] };
+  },
+  setChatRoom: (roomId, room) => {
+    const chats = DB.getChats();
+    chats[roomId] = room;
+    DB.setChats(chats);
+  },
+};
+
+// ─── CHAT STATE ───────────────────────────────────────────────
+let chatState = {
+  open: false,
+  roomId: null,
+  otherUserId: null,
+  pollInterval: null,
+  lastMsgCount: 0,
 };
 
 // ─── STATE ───────────────────────────────────────────────────
@@ -53,15 +74,25 @@ function init() {
     DB.setUsers(users);
   }
 
-  // Seed sample products
-  if (DB.getProducts().length === 0) {
-    seedProducts();
-  }
+  if (DB.getProducts().length === 0) seedProducts();
 
   state.user = DB.getCurrent();
   hashRoute();
   window.addEventListener('hashchange', hashRoute);
   renderNav();
+  updateBottomNav();
+
+  // Start chat poll (simulates WebSocket)
+  startChatPoll();
+
+  // Listen for localStorage changes (cross-tab "WebSocket" simulation)
+  window.addEventListener('storage', (e) => {
+    if (e.key === 'rm_chats' && chatState.open && chatState.roomId) {
+      renderChatMessages();
+      checkUnreadChats();
+    }
+    if (e.key === 'rm_chats') checkUnreadChats();
+  });
 }
 
 function seedProducts() {
@@ -80,11 +111,7 @@ function seedProducts() {
 
 // ─── UTILS ───────────────────────────────────────────────────
 function uid() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
-
-function fmt(v) {
-  return new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v);
-}
-
+function fmt(v) { return new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v); }
 function timeAgo(iso) {
   const d = Date.now() - new Date(iso).getTime();
   const m = Math.floor(d / 60000);
@@ -93,6 +120,10 @@ function timeAgo(iso) {
   const h = Math.floor(m / 60);
   if (h < 24) return `${h}h atrás`;
   return `${Math.floor(h / 24)}d atrás`;
+}
+function chatTime(iso) {
+  const d = new Date(iso);
+  return d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
 }
 
 function toast(msg, type = 'info') {
@@ -110,10 +141,12 @@ function modal(html) {
   document.getElementById('modal-overlay').addEventListener('click', e => {
     if (e.target.id === 'modal-overlay') closeModal();
   });
+  document.body.style.overflow = 'hidden';
 }
 
 function closeModal() {
   document.getElementById('modal-container').innerHTML = '';
+  document.body.style.overflow = '';
 }
 
 function navigate(route, params = {}) {
@@ -123,6 +156,7 @@ function navigate(route, params = {}) {
   history.pushState(null, '', hash);
   render();
   window.scrollTo(0, 0);
+  updateBottomNavActive(route);
 }
 
 function hashRoute() {
@@ -131,6 +165,7 @@ function hashRoute() {
   state.route = parts[0];
   state.params = parts[1] ? { id: parts[1] } : {};
   render();
+  updateBottomNavActive(state.route);
 }
 
 function searchProducts() {
@@ -138,6 +173,223 @@ function searchProducts() {
   state.searchQuery = q.trim();
   state.route = 'home';
   render();
+}
+
+function toggleMobileSearch() {
+  const bar = document.getElementById('mobile-search-bar');
+  bar.classList.toggle('visible');
+  if (bar.classList.contains('visible')) {
+    document.getElementById('mobile-search-input')?.focus();
+    // adjust main padding when search bar visible
+    document.getElementById('main').style.paddingTop = `calc(var(--nav-h) + 56px)`;
+  } else {
+    document.getElementById('main').style.paddingTop = '';
+  }
+}
+
+function mobileSearch() {
+  const q = document.getElementById('mobile-search-input')?.value || '';
+  state.searchQuery = q.trim();
+  state.route = 'home';
+  // sync desktop input
+  const di = document.getElementById('search-input');
+  if (di) di.value = q;
+  const bar = document.getElementById('mobile-search-bar');
+  bar.classList.remove('visible');
+  document.getElementById('main').style.paddingTop = '';
+  render();
+}
+
+function handleProfileNav() {
+  if (state.user) navigate('profile');
+  else showLogin();
+}
+
+function updateBottomNav() {
+  const u = state.user;
+  const cartCount = u ? DB.getCart().filter(c => c.userId === u.id).length : 0;
+  const badge = document.getElementById('bnav-cart-badge');
+  if (badge) {
+    badge.textContent = cartCount;
+    badge.style.display = cartCount > 0 ? 'flex' : 'none';
+  }
+  checkUnreadChats();
+}
+
+function updateBottomNavActive(route) {
+  document.querySelectorAll('.bottom-nav-btn').forEach(b => b.classList.remove('active'));
+  const map = { home: 'bnav-home', cart: 'bnav-cart', 'my-chats': 'bnav-chat', profile: 'bnav-profile' };
+  const id = map[route];
+  if (id) document.getElementById(id)?.classList.add('active');
+}
+
+function checkUnreadChats() {
+  if (!state.user) return;
+  const chats = DB.getChats();
+  let unread = 0;
+  Object.entries(chats).forEach(([roomId, room]) => {
+    if (!room.participants?.includes(state.user.id)) return;
+    (room.messages || []).forEach(m => {
+      if (m.senderId !== state.user.id && !m.read) unread++;
+    });
+  });
+  const badge = document.getElementById('bnav-chat-badge');
+  if (badge) {
+    badge.textContent = unread;
+    badge.style.display = unread > 0 ? 'flex' : 'none';
+  }
+}
+
+// ─── CHAT SYSTEM ─────────────────────────────────────────────
+
+function getChatRoomId(userId1, userId2) {
+  return [userId1, userId2].sort().join('__');
+}
+
+function openChat(otherUserId, productContext = null) {
+  if (!state.user) { showLogin(); return; }
+  if (otherUserId === state.user.id) { toast('Não pode conversar consigo mesmo', 'info'); return; }
+
+  const otherUser = DB.getUsers().find(u => u.id === otherUserId);
+  if (!otherUser) return;
+
+  const roomId = getChatRoomId(state.user.id, otherUserId);
+  chatState.roomId = roomId;
+  chatState.otherUserId = otherUserId;
+
+  // Init room if not exists
+  let room = DB.getChatRoom(roomId);
+  if (!room.participants || room.participants.length === 0) {
+    room.participants = [state.user.id, otherUserId];
+    room.messages = [];
+    // Add product context message
+    if (productContext) {
+      room.messages.push({
+        id: uid(),
+        senderId: '__system__',
+        text: `💬 Conversa iniciada sobre o produto: "${productContext}"`,
+        time: new Date().toISOString(),
+        read: false,
+      });
+    }
+    DB.setChatRoom(roomId, room);
+  }
+
+  // Update panel header
+  document.getElementById('chat-panel-avatar').src = otherUser.avatar || '';
+  document.getElementById('chat-panel-name').textContent = otherUser.username;
+  document.getElementById('chat-panel-status').textContent = 'online';
+
+  // Open panel
+  const panel = document.getElementById('chat-panel');
+  const overlay = document.getElementById('chat-overlay');
+  panel.classList.add('open');
+  overlay.classList.add('visible');
+  chatState.open = true;
+
+  renderChatMessages();
+  setTimeout(() => document.getElementById('chat-input')?.focus(), 300);
+}
+
+function closeChatPanel() {
+  const panel = document.getElementById('chat-panel');
+  const overlay = document.getElementById('chat-overlay');
+  panel.classList.remove('open');
+  overlay.classList.remove('visible');
+  chatState.open = false;
+  chatState.roomId = null;
+}
+
+function sendChatMessage() {
+  if (!state.user || !chatState.roomId) return;
+  const input = document.getElementById('chat-input');
+  const text = input?.value?.trim();
+  if (!text) return;
+
+  const room = DB.getChatRoom(chatState.roomId);
+  const msg = {
+    id: uid(),
+    senderId: state.user.id,
+    text,
+    time: new Date().toISOString(),
+    read: false,
+  };
+  room.messages.push(msg);
+  DB.setChatRoom(chatState.roomId, room);
+
+  input.value = '';
+  renderChatMessages();
+
+  // Notify other user
+  const notifs = DB.getNotifs();
+  notifs.push({
+    id: uid(),
+    userId: chatState.otherUserId,
+    type: 'chat',
+    message: `💬 ${state.user.username}: ${text.slice(0, 60)}${text.length > 60 ? '...' : ''}`,
+    chatRoomId: chatState.roomId,
+    otherUserId: state.user.id,
+    read: false,
+    createdAt: new Date().toISOString(),
+  });
+  DB.setNotifs(notifs);
+
+  // Trigger storage event for cross-tab simulation
+  const current = localStorage.getItem('rm_chats');
+  localStorage.setItem('rm_chats_ping', Date.now().toString());
+}
+
+function renderChatMessages() {
+  if (!chatState.roomId) return;
+  const room = DB.getChatRoom(chatState.roomId);
+  const msgs = room.messages || [];
+
+  // Mark messages as read
+  let updated = false;
+  msgs.forEach(m => {
+    if (m.senderId !== state.user?.id && !m.read) {
+      m.read = true;
+      updated = true;
+    }
+  });
+  if (updated) {
+    room.messages = msgs;
+    DB.setChatRoom(chatState.roomId, room);
+    checkUnreadChats();
+  }
+
+  const container = document.getElementById('chat-messages');
+  if (!container) return;
+
+  container.innerHTML = msgs.length === 0 ? `<div style="color:var(--text3);text-align:center;margin-top:32px;font-size:13px">Nenhuma mensagem ainda.<br>Diga olá! 👋</div>` :
+    msgs.map(m => {
+      if (m.senderId === '__system__') {
+        return `<div class="chat-system-msg">${m.text}</div>`;
+      }
+      const isSent = m.senderId === state.user?.id;
+      return `<div class="chat-msg ${isSent ? 'sent' : 'received'}">
+        ${m.text}
+        <span class="chat-msg-time">${chatTime(m.time)}${isSent ? ' ✓' : ''}</span>
+      </div>`;
+    }).join('');
+
+  // Scroll to bottom
+  container.scrollTop = container.scrollHeight;
+  chatState.lastMsgCount = msgs.length;
+}
+
+function startChatPoll() {
+  // Poll every 1.5 seconds for new messages (simulates WebSocket)
+  setInterval(() => {
+    if (chatState.open && chatState.roomId) {
+      const room = DB.getChatRoom(chatState.roomId);
+      const count = room.messages?.length || 0;
+      if (count !== chatState.lastMsgCount) {
+        renderChatMessages();
+      }
+    }
+    if (state.user) checkUnreadChats();
+  }, 1500);
 }
 
 // ─── NAV RENDER ──────────────────────────────────────────────
@@ -155,8 +407,8 @@ function renderNav() {
   } else {
     el.innerHTML = `
       ${u.isSeller ? `<button class="nav-btn" onclick="navigate('seller-dashboard')">Vender</button>` : ''}
-      <button class="nav-icon-btn" onclick="navigate('favorites')" title="Favoritos">❤
-        ${DB.getFavs().filter(f => f.userId === u.id).length > 0 ? `<span class="badge">${DB.getFavs().filter(f => f.userId === u.id).length}</span>` : ''}
+      <button class="nav-icon-btn" onclick="navigate('my-chats')" title="Chat">💬
+        ${getUnreadChatCount() > 0 ? `<span class="badge">${getUnreadChatCount()}</span>` : ''}
       </button>
       <button class="nav-icon-btn" onclick="navigate('cart')" title="Carrinho">🛒
         ${cartCount > 0 ? `<span class="badge">${cartCount}</span>` : ''}
@@ -164,9 +416,23 @@ function renderNav() {
       <button class="nav-icon-btn" onclick="navigate('notifications')" title="Notificações">🔔
         ${notifs > 0 ? `<span class="badge">${notifs}</span>` : ''}
       </button>
-      <img class="avatar-nav" src="${u.avatar}" alt="${u.username}" onclick="navigate('profile')">
+      <img class="avatar-nav" src="${u.avatar}" alt="${u.username}" onclick="navigate('profile')" onerror="this.src='https://api.dicebear.com/7.x/initials/svg?seed=${u.username}'">
     `;
   }
+  updateBottomNav();
+}
+
+function getUnreadChatCount() {
+  if (!state.user) return 0;
+  const chats = DB.getChats();
+  let unread = 0;
+  Object.entries(chats).forEach(([, room]) => {
+    if (!room.participants?.includes(state.user.id)) return;
+    (room.messages || []).forEach(m => {
+      if (m.senderId !== state.user.id && !m.read) unread++;
+    });
+  });
+  return unread;
 }
 
 // ─── MAIN RENDER ─────────────────────────────────────────────
@@ -191,14 +457,12 @@ function render() {
     notifications: renderNotifications,
     'admin-users': renderAdminUsers,
     orders: renderOrders,
+    'my-chats': renderMyChats,
   };
 
   const fn = routes[state.route];
-  if (fn) {
-    main.innerHTML = fn();
-  } else {
-    main.innerHTML = renderHome();
-  }
+  if (fn) main.innerHTML = fn();
+  else main.innerHTML = renderHome();
   attachEvents();
 }
 
@@ -225,8 +489,9 @@ function renderHome() {
       <p>A loja minimalista que você merece</p>
     </div>
   ` : `
-    <div style="padding:20px 24px;border-bottom:1px solid var(--border);background:var(--bg2);">
-      <p style="color:var(--text2);font-size:14px;">Resultados para: <strong style="color:var(--text)">"${state.searchQuery}"</strong> — ${prods.length} produto(s)</p>
+    <div style="padding:14px 16px;border-bottom:1px solid var(--border);background:var(--bg2);">
+      <p style="color:var(--text2);font-size:13px;">Resultados para: <strong style="color:var(--text)">"${state.searchQuery}"</strong> — ${prods.length} produto(s)
+      <button onclick="state.searchQuery='';render()" style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:12px;margin-left:8px">✕ Limpar</button></p>
     </div>
   `;
 
@@ -260,24 +525,21 @@ function renderHome() {
 
 function renderProductCard(p, favs, coupons) {
   const isFav = favs.includes(p.id);
-  // Find best discount for this product
   const applicable = coupons.filter(c => c.sellerId === p.sellerId && c.active);
   const bestDiscount = applicable.length > 0 ? Math.max(...applicable.map(c => c.discount)) : 0;
   const discountedPrice = bestDiscount > 0 ? p.price * (1 - bestDiscount / 100) : p.price;
-  const showDiscount = bestDiscount > 0;
-  const seller = DB.getUsers().find(u => u.id === p.sellerId);
 
   return `
     <div class="product-card" onclick="navigate('product', {id:'${p.id}'})">
-      ${showDiscount ? `<span class="discount-badge">-${bestDiscount}%</span>` : ''}
+      ${bestDiscount > 0 ? `<span class="discount-badge">-${bestDiscount}%</span>` : ''}
       <button class="product-card-fav ${isFav ? 'active' : ''}" onclick="event.stopPropagation();toggleFav('${p.id}')">${isFav ? '❤' : '♡'}</button>
       <img class="product-card-img" src="${p.images[0]}" alt="${p.title}" loading="lazy" onerror="this.src='https://via.placeholder.com/300x300/111111/444444?text=IMG'">
       <div class="product-card-info">
         <div class="product-card-title">${p.title}</div>
         <div class="product-card-price">
           ${fmt(discountedPrice)}
-          ${showDiscount ? `<span class="original">${fmt(p.price)}</span>` : ''}
-          ${p.originalPrice && !showDiscount ? `<span class="original">${fmt(p.originalPrice)}</span>` : ''}
+          ${bestDiscount > 0 ? `<span class="original">${fmt(p.price)}</span>` : ''}
+          ${p.originalPrice && !bestDiscount ? `<span class="original">${fmt(p.originalPrice)}</span>` : ''}
         </div>
         <div class="product-card-sold">${p.sold || 0} vendidos</div>
       </div>
@@ -300,16 +562,17 @@ function renderProduct() {
   const isFav = favs.includes(p.id);
   const coupons = DB.getCoupons().filter(c => c.sellerId === p.sellerId && c.active);
   const bestDiscount = coupons.length > 0 ? Math.max(...coupons.map(c => c.discount)) : 0;
-  const finalPrice = bestDiscount > 0 ? p.price * (1 - bestDiscount / 100) : (p.originalPrice ? p.originalPrice : p.price);
-  const displayPrice = p.originalPrice && !bestDiscount ? p.price : (bestDiscount > 0 ? p.price * (1 - bestDiscount / 100) : p.price);
+  const displayPrice = bestDiscount > 0 ? p.price * (1 - bestDiscount / 100) : p.price;
 
   const thumbs = p.images.length > 1 ? p.images.map((img, i) => `
-    <img class="product-thumb ${i === 0 ? 'active' : ''}" src="${img}" alt="" onclick="switchImg(this, '${img}')" onerror="this.src='https://via.placeholder.com/64x64/111111/444444?text=IMG'">
+    <img class="product-thumb ${i === 0 ? 'active' : ''}" src="${img}" alt="" onclick="switchImg(this, '${img}')" onerror="this.style.display='none'">
   `).join('') : '';
 
+  const isOwnProduct = state.user && state.user.id === p.sellerId;
+
   return `
-    <div class="page-container" style="padding-top:32px">
-      <button class="btn btn-outline btn-sm" style="margin-bottom:24px" onclick="history.back()">← Voltar</button>
+    <div class="page-container" style="padding-top:24px">
+      <button class="btn btn-outline btn-sm" style="margin-bottom:20px" onclick="history.back()">← Voltar</button>
       <div class="product-detail">
         <div class="product-images">
           <img class="product-main-img" id="main-img" src="${p.images[0]}" alt="${p.title}" onerror="this.src='https://via.placeholder.com/500x500/111111/444444?text=IMG'">
@@ -327,32 +590,37 @@ function renderProduct() {
             ${p.originalPrice && !bestDiscount ? `<span class="orig-price">${fmt(p.originalPrice)}</span>` : ''}
             ${bestDiscount > 0 ? `<span class="orig-price">${fmt(p.price)}</span>` : ''}
           </div>
-          ${bestDiscount > 0 ? `<div style="margin-bottom:12px"><span class="chip" style="color:var(--success);border-color:rgba(68,255,136,0.3)">🏷 Desconto ${bestDiscount}% aplicado</span></div>` : ''}
+          ${bestDiscount > 0 ? `<div style="margin-bottom:10px"><span class="chip" style="color:var(--success);border-color:rgba(68,255,136,0.3)">🏷 ${bestDiscount}% de desconto</span></div>` : ''}
 
-          <div style="margin-bottom:16px;font-size:14px;color:var(--text2);line-height:1.6">${p.description}</div>
+          <div style="margin-bottom:14px;font-size:14px;color:var(--text2);line-height:1.6">${p.description}</div>
 
           <div class="quantity-control">
             <button class="qty-btn" onclick="changeQty(-1)">−</button>
             <input class="qty-input" id="qty-input" type="number" value="1" min="1" max="${p.stock}">
             <button class="qty-btn" onclick="changeQty(1)">+</button>
-            <span style="font-size:13px;color:var(--text3)">Disponível: ${p.stock}</span>
+            <span style="font-size:12px;color:var(--text3)">Estoque: ${p.stock}</span>
           </div>
 
           <div class="coupon-input-row">
-            <input class="form-control" id="coupon-input" placeholder="Código do cupom..." style="font-family:'Space Mono',monospace;font-size:13px">
+            <input class="form-control" id="coupon-input" placeholder="Código do cupom...">
             <button class="btn btn-outline" onclick="applyCoupon('${p.id}','${p.sellerId}')">Aplicar</button>
           </div>
           <div id="coupon-result"></div>
 
-          <div style="display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap">
+          <div style="display:flex;gap:10px;margin-bottom:10px;flex-wrap:wrap">
             <button class="btn btn-primary" style="flex:1" onclick="addToCart('${p.id}')" ${p.stock === 0 ? 'disabled' : ''}>
-              🛒 Adicionar ao Carrinho
+              🛒 Adicionar
             </button>
-            <button class="btn btn-outline" onclick="toggleFav('${p.id}')">${isFav ? '❤ Favorito' : '♡ Favoritar'}</button>
+            <button class="btn btn-outline" onclick="toggleFav('${p.id}')">${isFav ? '❤' : '♡'}</button>
           </div>
-          <button class="btn btn-outline btn-full" onclick="buyNow('${p.id}')" ${p.stock === 0 ? 'disabled' : ''}>
+          <button class="btn btn-outline btn-full" onclick="buyNow('${p.id}')" ${p.stock === 0 ? 'disabled' : ''} style="margin-bottom:8px">
             ⚡ Comprar Agora
           </button>
+
+          ${!isOwnProduct ? `
+          <button class="chat-seller-btn" onclick="openChat('${seller.id}', '${p.title.replace(/'/g, "\\'")}')">
+            💬 Falar com o vendedor
+          </button>` : ''}
 
           <div class="seller-card-mini" onclick="navigate('seller-profile',{id:'${seller.id}'})">
             <img class="seller-avatar-mini" src="${seller.avatar || ''}" alt="${seller.username}" onerror="this.src='https://api.dicebear.com/7.x/initials/svg?seed=${seller.username}'">
@@ -389,18 +657,68 @@ function applyCoupon(productId, sellerId) {
   const coupons = DB.getCoupons();
   const coupon = coupons.find(c => c.code === code && c.sellerId === sellerId && c.active);
   const result = document.getElementById('coupon-result');
-  if (!coupon) {
-    result.innerHTML = `<div class="payment-status failed" style="font-size:12px">Cupom inválido ou expirado</div>`;
-    return;
-  }
-  if (coupon.uses >= coupon.maxUses) {
-    result.innerHTML = `<div class="payment-status failed" style="font-size:12px">Cupom esgotado</div>`;
-    return;
-  }
-  result.innerHTML = `<div class="payment-status confirmed" style="font-size:12px">✓ Cupom válido: ${coupon.discount}% de desconto aplicado!</div>`;
-  toast(`Cupom ${code} aplicado! ${coupon.discount}% off`, 'success');
-  // Store applied coupon
+  if (!coupon) { result.innerHTML = `<div class="payment-status failed" style="font-size:12px">Cupom inválido ou expirado</div>`; return; }
+  if (coupon.uses >= coupon.maxUses) { result.innerHTML = `<div class="payment-status failed" style="font-size:12px">Cupom esgotado</div>`; return; }
+  result.innerHTML = `<div class="payment-status confirmed" style="font-size:12px">✓ Cupom válido: ${coupon.discount}% de desconto!</div>`;
+  toast(`Cupom ${code} aplicado!`, 'success');
   sessionStorage.setItem('applied_coupon', JSON.stringify({ code, discount: coupon.discount, sellerId, couponId: coupon.id }));
+}
+
+// ─── MY CHATS PAGE ───────────────────────────────────────────
+function renderMyChats() {
+  if (!state.user) { showLogin(); return ''; }
+
+  const chats = DB.getChats();
+  const myRooms = Object.entries(chats).filter(([, room]) => room.participants?.includes(state.user.id));
+
+  if (myRooms.length === 0) {
+    return `
+      <div class="page-container" style="padding-top:28px;max-width:700px;margin:0 auto">
+        <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:20px">💬 CONVERSAS</h2>
+        <div class="empty-state">
+          <div class="icon">💬</div>
+          <h3>Nenhuma conversa ainda</h3>
+          <p>Acesse um produto e clique em "Falar com o vendedor"</p>
+        </div>
+      </div>
+    `;
+  }
+
+  const roomsHtml = myRooms.map(([roomId, room]) => {
+    const otherId = room.participants.find(id => id !== state.user.id);
+    const other = DB.getUsers().find(u => u.id === otherId);
+    if (!other) return '';
+    const msgs = room.messages || [];
+    const lastMsg = msgs.filter(m => m.senderId !== '__system__').at(-1);
+    const unread = msgs.filter(m => m.senderId !== state.user.id && m.senderId !== '__system__' && !m.read).length;
+
+    return `
+      <div class="chat-conv-item" onclick="openChatFromList('${otherId}')">
+        <img class="chat-conv-avatar" src="${other.avatar || ''}" alt="${other.username}" onerror="this.src='https://api.dicebear.com/7.x/initials/svg?seed=${other.username}'">
+        <div class="chat-conv-info">
+          <div class="chat-conv-name">${other.username} ${other.isSeller ? '<span style="font-size:10px;color:var(--success)">✓</span>' : ''}</div>
+          <div class="chat-conv-last">${lastMsg ? (lastMsg.senderId === state.user.id ? 'Você: ' : '') + lastMsg.text : 'Inicie a conversa'}</div>
+        </div>
+        <div class="chat-conv-meta">
+          ${lastMsg ? `<div class="chat-conv-time">${timeAgo(lastMsg.time)}</div>` : ''}
+          ${unread > 0 ? `<div class="chat-conv-unread">${unread}</div>` : ''}
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  return `
+    <div class="page-container" style="padding-top:28px;max-width:700px;margin:0 auto">
+      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:20px">💬 CONVERSAS</h2>
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius2);overflow:hidden">
+        ${roomsHtml}
+      </div>
+    </div>
+  `;
+}
+
+function openChatFromList(otherUserId) {
+  openChat(otherUserId);
 }
 
 // ─── AUTH ─────────────────────────────────────────────────────
@@ -411,19 +729,19 @@ function showLogin() {
       <h2>ENTRAR</h2>
       <div class="form-group">
         <label>Usuário</label>
-        <input class="form-control" id="login-user" placeholder="Seu usuário">
+        <input class="form-control" id="login-user" placeholder="Seu usuário" autocomplete="username">
       </div>
       <div class="form-group">
         <label>Senha</label>
-        <input class="form-control" id="login-pass" type="password" placeholder="Sua senha">
+        <input class="form-control" id="login-pass" type="password" placeholder="Sua senha" autocomplete="current-password">
       </div>
       <button class="btn btn-primary btn-full" onclick="doLogin()">Entrar</button>
-      <div style="text-align:center;margin-top:16px">
+      <div style="text-align:center;margin-top:14px">
         <span class="text-link" onclick="closeModal();showRegister()">Não tem conta? Cadastre-se</span>
       </div>
     </div>
   `);
-  setTimeout(() => document.getElementById('login-user')?.focus(), 100);
+  setTimeout(() => document.getElementById('login-user')?.focus(), 300);
 }
 
 function showRegister() {
@@ -433,22 +751,22 @@ function showRegister() {
       <h2>CADASTRAR</h2>
       <div class="form-group">
         <label>Usuário *</label>
-        <input class="form-control" id="reg-user" placeholder="Escolha um usuário">
+        <input class="form-control" id="reg-user" placeholder="Escolha um usuário" autocomplete="username">
       </div>
       <div class="form-group">
         <label>E-mail *</label>
-        <input class="form-control" id="reg-email" type="email" placeholder="seu@email.com">
+        <input class="form-control" id="reg-email" type="email" placeholder="seu@email.com" autocomplete="email">
       </div>
       <div class="form-group">
         <label>Telefone</label>
-        <input class="form-control" id="reg-phone" placeholder="(11) 99999-9999">
+        <input class="form-control" id="reg-phone" placeholder="(11) 99999-9999" type="tel">
       </div>
       <div class="form-group">
         <label>Senha *</label>
-        <input class="form-control" id="reg-pass" type="password" placeholder="Mínimo 6 caracteres">
+        <input class="form-control" id="reg-pass" type="password" placeholder="Mínimo 6 caracteres" autocomplete="new-password">
       </div>
       <button class="btn btn-primary btn-full" onclick="doRegister()">Criar conta</button>
-      <div style="text-align:center;margin-top:16px">
+      <div style="text-align:center;margin-top:14px">
         <span class="text-link" onclick="closeModal();showLogin()">Já tem conta? Entrar</span>
       </div>
     </div>
@@ -459,8 +777,7 @@ function doLogin() {
   const user = document.getElementById('login-user')?.value?.trim();
   const pass = document.getElementById('login-pass')?.value;
   if (!user || !pass) { toast('Preencha todos os campos', 'error'); return; }
-  const users = DB.getUsers();
-  const u = users.find(u => u.username === user && u.password === pass);
+  const u = DB.getUsers().find(u => u.username === user && u.password === pass);
   if (!u) { toast('Usuário ou senha incorretos', 'error'); return; }
   state.user = u;
   DB.setCurrent(u);
@@ -480,16 +797,9 @@ function doRegister() {
   if (users.find(u => u.username === username)) { toast('Usuário já existe', 'error'); return; }
   if (users.find(u => u.email === email)) { toast('E-mail já cadastrado', 'error'); return; }
   const newUser = {
-    id: uid(),
-    username,
-    email,
-    phone,
-    password,
+    id: uid(), username, email, phone, password,
     avatar: `https://api.dicebear.com/7.x/initials/svg?seed=${username}&backgroundColor=111111&textColor=ffffff`,
-    isSeller: false,
-    isAdmin: false,
-    createdAt: new Date().toISOString(),
-    bio: '',
+    isSeller: false, isAdmin: false, createdAt: new Date().toISOString(), bio: '',
   };
   users.push(newUser);
   DB.setUsers(users);
@@ -503,6 +813,7 @@ function doRegister() {
 function doLogout() {
   state.user = null;
   DB.setCurrent(null);
+  closeChatPanel();
   toast('Até logo!', 'info');
   navigate('home');
 }
@@ -532,7 +843,7 @@ function renderProfile() {
             <div class="profile-stats">
               <div class="profile-stat"><strong>${orders.length}</strong>pedidos</div>
               <div class="profile-stat"><strong>${favs.length}</strong>favoritos</div>
-              <div class="profile-stat"><strong>${cart.length}</strong>no carrinho</div>
+              <div class="profile-stat"><strong>${cart.length}</strong>carrinho</div>
             </div>
           </div>
           <button class="btn btn-outline btn-sm" style="margin-left:auto;align-self:flex-start" onclick="doLogout()">Sair</button>
@@ -549,29 +860,25 @@ function renderProfile() {
     </div>
     <div class="page-container" style="max-width:1000px;margin:0 auto">
       <div id="tab-info">
-        <div style="max-width:480px;margin-top:24px">
-          <h3 style="font-family:'Bebas Neue',sans-serif;font-size:20px;letter-spacing:2px;margin-bottom:16px">EDITAR PERFIL</h3>
+        <div style="max-width:480px;margin-top:20px">
+          <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin-bottom:14px">EDITAR PERFIL</h3>
           <div class="form-group"><label>Bio</label><textarea class="form-control" id="edit-bio" placeholder="Fale sobre você...">${u.bio || ''}</textarea></div>
-          <div class="form-group"><label>E-mail</label><input class="form-control" id="edit-email" value="${u.email || ''}"></div>
-          <div class="form-group"><label>Telefone</label><input class="form-control" id="edit-phone" value="${u.phone || ''}"></div>
+          <div class="form-group"><label>E-mail</label><input class="form-control" id="edit-email" value="${u.email || ''}" type="email"></div>
+          <div class="form-group"><label>Telefone</label><input class="form-control" id="edit-phone" value="${u.phone || ''}" type="tel"></div>
           <button class="btn btn-primary" onclick="saveProfile()">Salvar alterações</button>
-          ${!u.isSeller && !u.isAdmin ? `
-            <div class="divider"></div>
-            <p style="font-size:13px;color:var(--text3)">Para se tornar vendedor, solicite ao administrador.</p>
-          ` : ''}
         </div>
       </div>
       <div id="tab-orders" style="display:none">
-        <h3 style="font-family:'Bebas Neue',sans-serif;font-size:20px;letter-spacing:2px;margin:24px 0 16px">MEUS PEDIDOS</h3>
-        ${orders.length === 0 ? `<div class="empty-state"><div class="icon">📦</div><h3>Nenhum pedido ainda</h3><p>Faça sua primeira compra!</p></div>` :
-          orders.reverse().map(o => renderOrderCard(o)).join('')}
+        <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin:20px 0 14px">MEUS PEDIDOS</h3>
+        ${orders.length === 0 ? `<div class="empty-state"><div class="icon">📦</div><h3>Nenhum pedido ainda</h3></div>` :
+          [...orders].reverse().map(o => renderOrderCard(o)).join('')}
       </div>
       <div id="tab-cart" style="display:none">
-        <h3 style="font-family:'Bebas Neue',sans-serif;font-size:20px;letter-spacing:2px;margin:24px 0 16px">MEU CARRINHO</h3>
+        <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin:20px 0 14px">MEU CARRINHO</h3>
         ${renderCartContent()}
       </div>
       <div id="tab-favs" style="display:none">
-        <h3 style="font-family:'Bebas Neue',sans-serif;font-size:20px;letter-spacing:2px;margin:24px 0 16px">FAVORITOS</h3>
+        <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin:20px 0 14px">FAVORITOS</h3>
         ${renderFavsContent()}
       </div>
     </div>
@@ -589,7 +896,7 @@ function switchProfileTab(el, tabId) {
 function renderOrderCard(o) {
   const p = DB.getProducts().find(pr => pr.id === o.productId);
   const statusLabels = {
-    pending_payment: { label: 'Aguardando Pagamento', color: 'var(--warning)' },
+    pending_payment: { label: 'Aguardando', color: 'var(--warning)' },
     paid: { label: 'Pago', color: 'var(--success)' },
     processing: { label: 'Processando', color: 'var(--text2)' },
     shipped: { label: 'Enviado', color: '#4488ff' },
@@ -602,7 +909,7 @@ function renderOrderCard(o) {
       <img class="cart-item-img" src="${p?.images[0] || ''}" alt="" onerror="this.src='https://via.placeholder.com/80x80/111/444?text=?'">
       <div class="cart-item-info">
         <div class="cart-item-title">${p?.title || 'Produto'}</div>
-        <div style="font-size:12px;color:var(--text3)">${timeAgo(o.createdAt)} • Qtd: ${o.quantity}</div>
+        <div style="font-size:11px;color:var(--text3)">${timeAgo(o.createdAt)} • Qtd: ${o.quantity}</div>
         <div class="cart-item-price" style="margin-top:4px">${fmt(o.total)}</div>
       </div>
       <div style="text-align:right;flex-shrink:0">
@@ -656,23 +963,26 @@ function renderSellerProfile() {
   const products = DB.getProducts().filter(p => p.sellerId === seller.id);
   const favs = state.user ? DB.getFavs().filter(f => f.userId === state.user.id).map(f => f.productId) : [];
   const coupons = DB.getCoupons();
+  const isOwnProfile = state.user?.id === seller.id;
 
   return `
     <div class="profile-header">
       <div class="profile-header-inner">
         <div class="profile-top">
-          <div class="profile-avatar-wrap">
-            <img class="profile-avatar" src="${seller.avatar}" alt="${seller.username}" onerror="this.src='https://api.dicebear.com/7.x/initials/svg?seed=${seller.username}'">
-          </div>
+          <img class="profile-avatar" src="${seller.avatar}" alt="${seller.username}" onerror="this.src='https://api.dicebear.com/7.x/initials/svg?seed=${seller.username}'">
           <div class="profile-info">
             <h2>${seller.username}</h2>
             ${seller.isAdmin ? '<div class="seller-badge">⭐ Vendedor Oficial</div>' : seller.isSeller ? '<div class="seller-badge">✓ Vendedor</div>' : ''}
-            <div style="font-size:13px;color:var(--text2);margin-top:8px">${seller.bio || ''}</div>
+            <div style="font-size:12px;color:var(--text2);margin-top:6px">${seller.bio || ''}</div>
             <div class="profile-stats">
               <div class="profile-stat"><strong>${products.length}</strong>produtos</div>
               <div class="profile-stat"><strong>${products.reduce((a,p) => a + (p.sold||0), 0)}</strong>vendidos</div>
             </div>
           </div>
+          ${!isOwnProfile ? `
+          <button class="btn btn-outline btn-sm" style="margin-left:auto;align-self:flex-start;gap:6px" onclick="openChat('${seller.id}')">
+            💬 Conversar
+          </button>` : ''}
         </div>
         <div class="profile-tabs">
           <div class="profile-tab active">Produtos</div>
@@ -695,7 +1005,7 @@ function renderCart() {
   const products = DB.getProducts();
   let total = 0;
 
-  const itemsHtml = cartItems.length === 0 ? `<div class="empty-state"><div class="icon">🛒</div><h3>Carrinho vazio</h3><p>Adicione produtos para continuar</p></div>` :
+  const itemsHtml = cartItems.length === 0 ? `<div class="empty-state"><div class="icon">🛒</div><h3>Carrinho vazio</h3><p>Adicione produtos!</p></div>` :
     cartItems.map(item => {
       const p = products.find(pr => pr.id === item.productId);
       if (!p) return '';
@@ -706,25 +1016,25 @@ function renderCart() {
           <img class="cart-item-img" src="${p.images[0]}" alt="${p.title}" onclick="navigate('product',{id:'${p.id}'})" style="cursor:pointer" onerror="this.src='https://via.placeholder.com/80x80/111/444?text=?'">
           <div class="cart-item-info">
             <div class="cart-item-title">${p.title}</div>
-            <div style="font-size:12px;color:var(--text3)">Unitário: ${fmt(p.price)}</div>
-            <div style="display:flex;align-items:center;gap:12px;margin-top:8px">
-              <button class="qty-btn" onclick="updateCartQty('${item.productId}',-1)" style="width:28px;height:28px;font-size:14px">−</button>
+            <div style="font-size:11px;color:var(--text3)">${fmt(p.price)} un.</div>
+            <div style="display:flex;align-items:center;gap:10px;margin-top:6px">
+              <button class="qty-btn" onclick="updateCartQty('${item.productId}',-1)" style="width:32px;height:32px;font-size:16px">−</button>
               <span style="font-family:'Space Mono',monospace;font-size:14px">${item.quantity}</span>
-              <button class="qty-btn" onclick="updateCartQty('${item.productId}',1)" style="width:28px;height:28px;font-size:14px">+</button>
+              <button class="qty-btn" onclick="updateCartQty('${item.productId}',1)" style="width:32px;height:32px;font-size:16px">+</button>
             </div>
           </div>
           <div style="text-align:right;flex-shrink:0">
             <div class="cart-item-price">${fmt(subtotal)}</div>
-            <button class="btn btn-outline btn-sm" style="margin-top:8px;border-color:var(--danger);color:var(--danger)" onclick="removeFromCart('${item.productId}')">Remover</button>
+            <button class="btn btn-outline btn-sm" style="margin-top:6px;border-color:var(--danger);color:var(--danger)" onclick="removeFromCart('${item.productId}')">×</button>
           </div>
         </div>
       `;
     }).join('');
 
   return `
-    <div class="page-container" style="padding-top:32px">
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:32px;letter-spacing:3px;margin-bottom:24px">MEU CARRINHO</h2>
-      <div class="two-col">
+    <div class="page-container" style="padding-top:24px">
+      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:20px">🛒 CARRINHO</h2>
+      <div class="checkout-layout">
         <div>${itemsHtml}</div>
         ${cartItems.length > 0 ? `
         <div class="cart-summary">
@@ -732,7 +1042,7 @@ function renderCart() {
           <div class="summary-row"><span>Subtotal</span><span>${fmt(total)}</span></div>
           <div class="summary-row"><span>Frete</span><span>A calcular</span></div>
           <div class="summary-row total"><span>Total</span><span>${fmt(total)}</span></div>
-          <button class="btn btn-primary btn-full" style="margin-top:16px" onclick="checkoutCart()">Finalizar compra →</button>
+          <button class="btn btn-primary btn-full" style="margin-top:14px" onclick="checkoutCart()">Finalizar compra →</button>
         </div>` : ''}
       </div>
     </div>
@@ -741,10 +1051,9 @@ function renderCart() {
 
 function renderCartContent() {
   const cartItems = DB.getCart().filter(c => c.userId === state.user.id);
-  const products = DB.getProducts();
   if (cartItems.length === 0) return `<div class="empty-state" style="padding:40px"><div class="icon">🛒</div><h3>Carrinho vazio</h3></div>`;
   return cartItems.map(item => {
-    const p = products.find(pr => pr.id === item.productId);
+    const p = DB.getProducts().find(pr => pr.id === item.productId);
     if (!p) return '';
     return `
       <div class="cart-item" style="cursor:pointer" onclick="navigate('product',{id:'${p.id}'})">
@@ -761,26 +1070,20 @@ function renderCartContent() {
 
 function renderFavsContent() {
   const favs = DB.getFavs().filter(f => f.userId === state.user.id);
-  const products = DB.getProducts();
   if (favs.length === 0) return `<div class="empty-state" style="padding:40px"><div class="icon">❤</div><h3>Nenhum favorito</h3></div>`;
-  const favProds = favs.map(f => products.find(p => p.id === f.productId)).filter(Boolean);
-  const coupons = DB.getCoupons();
-  return `<div class="product-grid">${favProds.map(p => renderProductCard(p, favs.map(f => f.productId), coupons)).join('')}</div>`;
+  const favProds = favs.map(f => DB.getProducts().find(p => p.id === f.productId)).filter(Boolean);
+  return `<div class="product-grid">${favProds.map(p => renderProductCard(p, favs.map(f => f.productId), DB.getCoupons())).join('')}</div>`;
 }
 
-// ─── FAVORITES PAGE ──────────────────────────────────────────
 function renderFavorites() {
   if (!state.user) { showLogin(); return ''; }
   const favs = DB.getFavs().filter(f => f.userId === state.user.id);
-  const products = DB.getProducts();
-  const coupons = DB.getCoupons();
-  const favProds = favs.map(f => products.find(p => p.id === f.productId)).filter(Boolean);
-
+  const favProds = favs.map(f => DB.getProducts().find(p => p.id === f.productId)).filter(Boolean);
   return `
-    <div class="page-container" style="padding-top:32px">
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:32px;letter-spacing:3px;margin-bottom:24px">❤ FAVORITOS</h2>
+    <div class="page-container" style="padding-top:24px">
+      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:20px">❤ FAVORITOS</h2>
       ${favProds.length === 0 ? `<div class="empty-state"><div class="icon">❤</div><h3>Nenhum favorito ainda</h3></div>` :
-        `<div class="product-grid">${favProds.map(p => renderProductCard(p, favs.map(f => f.productId), coupons)).join('')}</div>`}
+        `<div class="product-grid">${favProds.map(p => renderProductCard(p, favs.map(f => f.productId), DB.getCoupons())).join('')}</div>`}
     </div>
   `;
 }
@@ -791,19 +1094,15 @@ function addToCart(productId) {
   const cart = DB.getCart();
   const qty = parseInt(document.getElementById('qty-input')?.value) || 1;
   const existing = cart.find(c => c.userId === state.user.id && c.productId === productId);
-  if (existing) {
-    existing.quantity = Math.min(existing.quantity + qty, 99);
-  } else {
-    cart.push({ userId: state.user.id, productId, quantity: qty });
-  }
+  if (existing) existing.quantity = Math.min(existing.quantity + qty, 99);
+  else cart.push({ userId: state.user.id, productId, quantity: qty });
   DB.setCart(cart);
   toast('Adicionado ao carrinho!', 'success');
   renderNav();
 }
 
 function removeFromCart(productId) {
-  const cart = DB.getCart().filter(c => !(c.userId === state.user.id && c.productId === productId));
-  DB.setCart(cart);
+  DB.setCart(DB.getCart().filter(c => !(c.userId === state.user.id && c.productId === productId)));
   renderNav();
 }
 
@@ -812,10 +1111,6 @@ function updateCartQty(productId, delta) {
   const item = cart.find(c => c.userId === state.user.id && c.productId === productId);
   if (item) {
     item.quantity = Math.max(1, item.quantity + delta);
-    if (item.quantity === 0) {
-      const idx = cart.indexOf(item);
-      cart.splice(idx, 1);
-    }
     DB.setCart(cart);
     render();
   }
@@ -825,13 +1120,8 @@ function toggleFav(productId) {
   if (!state.user) { showLogin(); return; }
   const favs = DB.getFavs();
   const idx = favs.findIndex(f => f.userId === state.user.id && f.productId === productId);
-  if (idx >= 0) {
-    favs.splice(idx, 1);
-    toast('Removido dos favoritos', 'info');
-  } else {
-    favs.push({ userId: state.user.id, productId });
-    toast('Adicionado aos favoritos!', 'success');
-  }
+  if (idx >= 0) { favs.splice(idx, 1); toast('Removido dos favoritos', 'info'); }
+  else { favs.push({ userId: state.user.id, productId }); toast('Adicionado aos favoritos!', 'success'); }
   DB.setFavs(favs);
   renderNav();
   render();
@@ -840,7 +1130,6 @@ function toggleFav(productId) {
 function checkoutCart() {
   const cartItems = DB.getCart().filter(c => c.userId === state.user.id);
   if (cartItems.length === 0) return;
-  // Use first product for now (multi-product checkout)
   sessionStorage.setItem('checkout_cart', JSON.stringify(cartItems));
   navigate('checkout', { id: 'cart' });
 }
@@ -874,57 +1163,50 @@ function renderCheckout() {
     }).filter(Boolean);
   } else if (buyNow) {
     const p = products.find(pr => pr.id === buyNow.productId);
-    if (p) {
-      const sub = p.price * buyNow.quantity;
-      total += sub;
-      items = [{ product: p, quantity: buyNow.quantity, subtotal: sub }];
-    }
+    if (p) { const sub = p.price * buyNow.quantity; total += sub; items = [{ product: p, quantity: buyNow.quantity, subtotal: sub }]; }
   }
 
-  let discountedTotal = total;
-  if (coupon) {
-    discountedTotal = total * (1 - coupon.discount / 100);
-  }
+  let discountedTotal = coupon ? total * (1 - coupon.discount / 100) : total;
 
   return `
-    <div class="page-container" style="padding-top:32px">
-      <button class="btn btn-outline btn-sm" style="margin-bottom:24px" onclick="history.back()">← Voltar</button>
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:32px;letter-spacing:3px;margin-bottom:24px">CHECKOUT</h2>
+    <div class="page-container" style="padding-top:24px">
+      <button class="btn btn-outline btn-sm" style="margin-bottom:20px" onclick="history.back()">← Voltar</button>
+      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:20px">CHECKOUT</h2>
       <div class="checkout-layout">
         <div>
-          <h3 style="font-family:'Bebas Neue',sans-serif;font-size:20px;letter-spacing:2px;margin-bottom:20px">DADOS DE ENTREGA</h3>
-          <div class="form-group"><label>Nome completo *</label><input class="form-control" id="co-name" value="${state.user.username}" placeholder="Seu nome completo"></div>
-          <div class="form-group"><label>E-mail *</label><input class="form-control" id="co-email" type="email" value="${state.user.email || ''}" placeholder="seu@email.com"></div>
-          <div class="form-group"><label>Telefone *</label><input class="form-control" id="co-phone" value="${state.user.phone || ''}" placeholder="(11) 99999-9999"></div>
+          <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin-bottom:16px">DADOS DE ENTREGA</h3>
+          <div class="form-group"><label>Nome completo *</label><input class="form-control" id="co-name" value="${state.user.username}"></div>
+          <div class="form-group"><label>E-mail *</label><input class="form-control" id="co-email" type="email" value="${state.user.email || ''}"></div>
+          <div class="form-group"><label>Telefone *</label><input class="form-control" id="co-phone" value="${state.user.phone || ''}" type="tel"></div>
           <div class="divider"></div>
-          <h3 style="font-family:'Bebas Neue',sans-serif;font-size:20px;letter-spacing:2px;margin-bottom:20px">ENDEREÇO</h3>
+          <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin-bottom:16px">ENDEREÇO</h3>
           <div class="two-col">
             <div class="form-group"><label>CEP *</label><input class="form-control" id="co-cep" placeholder="00000-000" oninput="fetchCEP(this.value)"></div>
-            <div class="form-group"><label>Número *</label><input class="form-control" id="co-num" placeholder="123"></div>
+            <div class="form-group"><label>Número *</label><input class="form-control" id="co-num"></div>
           </div>
-          <div class="form-group"><label>Rua *</label><input class="form-control" id="co-street" placeholder="Nome da rua"></div>
+          <div class="form-group"><label>Rua *</label><input class="form-control" id="co-street"></div>
           <div class="two-col">
-            <div class="form-group"><label>Bairro</label><input class="form-control" id="co-neighborhood" placeholder="Bairro"></div>
-            <div class="form-group"><label>Complemento</label><input class="form-control" id="co-complement" placeholder="Apto, sala..."></div>
+            <div class="form-group"><label>Bairro</label><input class="form-control" id="co-neighborhood"></div>
+            <div class="form-group"><label>Complemento</label><input class="form-control" id="co-complement"></div>
           </div>
           <div class="two-col">
-            <div class="form-group"><label>Cidade *</label><input class="form-control" id="co-city" placeholder="Cidade"></div>
-            <div class="form-group"><label>Estado *</label><input class="form-control" id="co-state" placeholder="SP"></div>
+            <div class="form-group"><label>Cidade *</label><input class="form-control" id="co-city"></div>
+            <div class="form-group"><label>Estado *</label><input class="form-control" id="co-state"></div>
           </div>
         </div>
         <div>
           <div class="cart-summary">
-            <h3>RESUMO DO PEDIDO</h3>
+            <h3>RESUMO</h3>
             ${items.map(i => `
               <div class="summary-row" style="align-items:center;gap:8px">
-                <img src="${i.product.images[0]}" style="width:40px;height:40px;object-fit:cover;border-radius:4px;flex-shrink:0" onerror="this.style.display='none'">
-                <span style="flex:1;font-size:13px">${i.product.title} ×${i.quantity}</span>
+                <img src="${i.product.images[0]}" style="width:36px;height:36px;object-fit:cover;border-radius:4px;flex-shrink:0" onerror="this.style.display='none'">
+                <span style="flex:1;font-size:12px">${i.product.title} ×${i.quantity}</span>
                 <span>${fmt(i.subtotal)}</span>
               </div>
             `).join('')}
             ${coupon ? `<div class="summary-row" style="color:var(--success)"><span>Cupom (${coupon.discount}%)</span><span>-${fmt(total - discountedTotal)}</span></div>` : ''}
             <div class="summary-row total"><span>Total</span><span>${fmt(discountedTotal)}</span></div>
-            <button class="btn btn-primary btn-full" style="margin-top:20px" onclick="placeOrder(${discountedTotal}, ${total}, ${JSON.stringify(items.map(i => ({id: i.product.id, qty: i.quantity, price: i.product.price})))})" >
+            <button class="btn btn-primary btn-full" style="margin-top:16px" onclick="placeOrder(${discountedTotal}, ${total}, ${JSON.stringify(items.map(i => ({id: i.product.id, qty: i.quantity, price: i.product.price})))})">
               Confirmar e Pagar →
             </button>
           </div>
@@ -959,19 +1241,18 @@ function placeOrder(total, originalTotal, itemsData) {
   const st = document.getElementById('co-state')?.value?.trim();
 
   if (!name || !email || !phone || !street || !num || !city || !st) {
-    toast('Preencha todos os campos obrigatórios', 'error');
-    return;
+    toast('Preencha todos os campos obrigatórios', 'error'); return;
   }
 
-  const address = { name, email, phone, street, num, city, state: st, neighborhood: document.getElementById('co-neighborhood')?.value || '', complement: document.getElementById('co-complement')?.value || '' };
+  const address = { name, email, phone, street, num, city, state: st,
+    neighborhood: document.getElementById('co-neighborhood')?.value || '',
+    complement: document.getElementById('co-complement')?.value || '' };
+
   const coupon = JSON.parse(sessionStorage.getItem('applied_coupon') || 'null');
   const products = DB.getProducts();
-
-  // Create one order per item (per seller)
   const orders = DB.getOrders();
   let firstOrderId = null;
 
-  // Group by seller
   const bySeller = {};
   itemsData.forEach(item => {
     const p = products.find(pr => pr.id === item.id);
@@ -983,24 +1264,16 @@ function placeOrder(total, originalTotal, itemsData) {
   Object.entries(bySeller).forEach(([sellerId, sellerItems]) => {
     const orderTotal = sellerItems.reduce((a, i) => a + i.price * i.qty, 0) * (coupon && coupon.sellerId === sellerId ? (1 - coupon.discount / 100) : 1);
     const order = {
-      id: uid(),
-      buyerId: state.user.id,
-      sellerId,
-      productId: sellerItems[0].productId,
-      quantity: sellerItems[0].qty,
-      items: sellerItems,
-      address,
+      id: uid(), buyerId: state.user.id, sellerId, productId: sellerItems[0].productId,
+      quantity: sellerItems[0].qty, items: sellerItems, address,
       total: parseFloat(orderTotal.toFixed(2)),
       coupon: coupon && coupon.sellerId === sellerId ? coupon : null,
       status: 'pending_payment',
       tracking: [{ status: 'Pedido criado', date: new Date().toISOString(), location: 'Sistema' }],
-      pixKey: generatePixKey(),
-      createdAt: new Date().toISOString(),
+      pixKey: generatePixKey(), createdAt: new Date().toISOString(),
     };
     orders.push(order);
     if (!firstOrderId) firstOrderId = order.id;
-
-    // Use coupon
     if (coupon && coupon.sellerId === sellerId) {
       const coupons = DB.getCoupons();
       const idx = coupons.findIndex(c => c.id === coupon.couponId);
@@ -1012,11 +1285,7 @@ function placeOrder(total, originalTotal, itemsData) {
   sessionStorage.removeItem('applied_coupon');
   sessionStorage.removeItem('buy_now');
   sessionStorage.removeItem('checkout_cart');
-
-  // Clear cart
-  const cart = DB.getCart().filter(c => c.userId !== state.user.id || !itemsData.find(i => i.id === c.productId));
-  DB.setCart(cart);
-
+  DB.setCart(DB.getCart().filter(c => c.userId !== state.user.id || !itemsData.find(i => i.id === c.productId)));
   navigate('payment', { id: firstOrderId });
 }
 
@@ -1029,38 +1298,31 @@ function renderPayment() {
   const order = DB.getOrders().find(o => o.id === state.params.id);
   if (!order) return `<div class="page-container"><div class="empty-state"><div class="icon">😕</div><h3>Pedido não encontrado</h3></div></div>`;
   const product = DB.getProducts().find(p => p.id === order.productId);
-
   const isPaid = order.status !== 'pending_payment';
 
   return `
-    <div class="page-container" style="padding-top:32px">
+    <div class="page-container" style="padding-top:24px">
       <div class="payment-box">
         ${isPaid ? `
-          <div style="font-size:64px;margin-bottom:16px">✅</div>
+          <div style="font-size:56px;margin-bottom:14px">✅</div>
           <h2>PAGAMENTO<br>CONFIRMADO</h2>
-          <p style="color:var(--text2);margin:16px 0">Seu pedido foi confirmado e o vendedor foi notificado.</p>
+          <p style="color:var(--text2);margin:14px 0">Pedido confirmado! Vendedor notificado.</p>
           <button class="btn btn-primary" onclick="navigate('tracking',{id:'${order.id}'})">Rastrear pedido →</button>
         ` : `
           <h2>PAGUE VIA<br>PIX</h2>
-          <p style="color:var(--text2);font-size:14px">Pedido: ${product?.title || 'Produto'} — ${fmt(order.total)}</p>
+          <p style="color:var(--text2);font-size:13px">${product?.title || 'Produto'} — ${fmt(order.total)}</p>
           <div id="qrcode"></div>
-          <p style="font-size:12px;color:var(--text3);margin-bottom:8px">Ou copie a chave PIX:</p>
+          <p style="font-size:11px;color:var(--text3);margin-bottom:6px">Ou copie a chave PIX:</p>
           <div class="pix-key-box">
             <span id="pix-key-text">${order.pixKey}</span>
             <button class="btn btn-outline btn-sm" onclick="copyPixKey('${order.pixKey}')">Copiar</button>
           </div>
-          <div class="payment-status pending" id="payment-status">
-            ⏳ Aguardando confirmação do pagamento...
-          </div>
+          <div class="payment-status pending" id="payment-status">⏳ Aguardando confirmação...</div>
           <div class="countdown" id="payment-countdown">10:00</div>
           <div class="progress-bar"><div class="progress-fill" id="payment-progress" style="width:100%"></div></div>
-          <p style="font-size:12px;color:var(--text3);margin-bottom:16px">Após pagar, a confirmação é automática</p>
-          <button class="btn btn-success btn-full" onclick="simulatePayment('${order.id}')">
-            ✓ Já realizei o pagamento
-          </button>
-          <button class="btn btn-outline btn-full" style="margin-top:8px" onclick="navigate('tracking',{id:'${order.id}'})">
-            Rastrear pedido
-          </button>
+          <p style="font-size:11px;color:var(--text3);margin-bottom:14px">Após pagar, a confirmação é automática</p>
+          <button class="btn btn-success btn-full" onclick="simulatePayment('${order.id}')">✓ Já realizei o pagamento</button>
+          <button class="btn btn-outline btn-full" style="margin-top:8px" onclick="navigate('tracking',{id:'${order.id}'})">Rastrear pedido</button>
         `}
       </div>
     </div>
@@ -1068,20 +1330,16 @@ function renderPayment() {
 }
 
 function attachEvents() {
-  // Generate QR code on payment page
   if (state.route === 'payment') {
     const order = DB.getOrders().find(o => o.id === state.params.id);
     if (order && order.status === 'pending_payment') {
       setTimeout(() => {
         const qrContainer = document.getElementById('qrcode');
         if (qrContainer && typeof QRCode !== 'undefined') {
-          const pixPayload = generatePixPayload(order.total, order.pixKey);
           new QRCode(qrContainer, {
-            text: pixPayload,
-            width: 200,
-            height: 200,
-            colorDark: '#000000',
-            colorLight: '#ffffff',
+            text: generatePixPayload(order.total, order.pixKey),
+            width: 180, height: 180,
+            colorDark: '#000000', colorLight: '#ffffff',
           });
         }
         startPaymentCountdown(order.id);
@@ -1091,15 +1349,11 @@ function attachEvents() {
 }
 
 function generatePixPayload(amount, key) {
-  // EMV-based PIX payload (simplified for simulation)
-  const merchantName = 'REDZIN MARKET';
-  const amountStr = amount.toFixed(2);
-  const keyStr = key;
-  return `00020126580014BR.GOV.BCB.PIX0136${keyStr}5204000053039865406${amountStr}5802BR5913${merchantName}6009SAO PAULO62140510REDZINMKT6304ABCD`;
+  return `00020126580014BR.GOV.BCB.PIX0136${key}5204000053039865406${amount.toFixed(2)}5802BR5913REDZIN MARKET6009SAO PAULO62140510REDZINMKT6304ABCD`;
 }
 
 function startPaymentCountdown(orderId) {
-  let seconds = 600; // 10 minutes
+  let seconds = 600;
   const interval = setInterval(() => {
     seconds--;
     const min = Math.floor(seconds / 60);
@@ -1108,84 +1362,50 @@ function startPaymentCountdown(orderId) {
     const pb = document.getElementById('payment-progress');
     if (cd) cd.textContent = `${String(min).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
     if (pb) pb.style.width = `${(seconds / 600) * 100}%`;
-    if (seconds <= 0) {
-      clearInterval(interval);
-      // Expire
-    }
-    // Check if order status changed
+    if (seconds <= 0) clearInterval(interval);
     const order = DB.getOrders().find(o => o.id === orderId);
-    if (order && order.status !== 'pending_payment') {
-      clearInterval(interval);
-    }
+    if (order && order.status !== 'pending_payment') clearInterval(interval);
   }, 1000);
 }
 
 function copyPixKey(key) {
   navigator.clipboard.writeText(key).then(() => toast('Chave PIX copiada!', 'success')).catch(() => {
-    // Fallback
     const el = document.createElement('textarea');
-    el.value = key;
-    document.body.appendChild(el);
-    el.select();
-    document.execCommand('copy');
-    el.remove();
+    el.value = key; document.body.appendChild(el); el.select();
+    document.execCommand('copy'); el.remove();
     toast('Chave PIX copiada!', 'success');
   });
 }
 
 function simulatePayment(orderId) {
-  // Show loading
   const btn = event.target;
-  btn.textContent = 'Verificando pagamento...';
+  btn.textContent = 'Verificando...';
   btn.disabled = true;
-
-  // Simulate payment verification (2 seconds)
-  setTimeout(() => {
-    confirmPayment(orderId);
-  }, 2000);
+  setTimeout(() => confirmPayment(orderId), 2000);
 }
 
 function confirmPayment(orderId) {
   const orders = DB.getOrders();
   const idx = orders.findIndex(o => o.id === orderId);
   if (idx < 0) return;
-
   orders[idx].status = 'paid';
   orders[idx].paidAt = new Date().toISOString();
   orders[idx].tracking.push({ status: 'Pagamento confirmado', date: new Date().toISOString(), location: 'Sistema financeiro' });
-
   DB.setOrders(orders);
 
-  // Notify seller
   const order = orders[idx];
   const notifs = DB.getNotifs();
   const product = DB.getProducts().find(p => p.id === order.productId);
-  notifs.push({
-    id: uid(),
-    userId: order.sellerId,
-    type: 'sale',
-    message: `🛍 Novo pedido! ${product?.title || 'Produto'} — ${fmt(order.total)} — de ${state.user?.username || 'comprador'}`,
-    orderId: order.id,
-    read: false,
-    createdAt: new Date().toISOString(),
-  });
+  notifs.push({ id: uid(), userId: order.sellerId, type: 'sale', message: `🛍 Novo pedido! ${product?.title || 'Produto'} — ${fmt(order.total)} — de ${state.user?.username || 'comprador'}`, orderId: order.id, read: false, createdAt: new Date().toISOString() });
   DB.setNotifs(notifs);
 
-  // Update product sold count
   const products = DB.getProducts();
   const pi = products.findIndex(p => p.id === order.productId);
   if (pi >= 0) { products[pi].sold = (products[pi].sold || 0) + order.quantity; DB.setProducts(products); }
 
-  // Update payment status UI
   const statusEl = document.getElementById('payment-status');
-  if (statusEl) {
-    statusEl.className = 'payment-status confirmed';
-    statusEl.textContent = '✓ Pagamento confirmado! Notificação enviada ao vendedor.';
-  }
-
-  setTimeout(() => {
-    render();
-  }, 1500);
+  if (statusEl) { statusEl.className = 'payment-status confirmed'; statusEl.textContent = '✓ Pagamento confirmado!'; }
+  setTimeout(() => render(), 1500);
 }
 
 // ─── TRACKING ────────────────────────────────────────────────
@@ -1195,6 +1415,7 @@ function renderTracking() {
 
   const product = DB.getProducts().find(p => p.id === order.productId);
   const isSeller = state.user && state.user.id === order.sellerId;
+  const buyer = DB.getUsers().find(u => u.id === order.buyerId);
 
   const statusLabels = {
     pending_payment: { label: '⏳ Aguardando Pagamento', color: 'var(--warning)' },
@@ -1205,7 +1426,7 @@ function renderTracking() {
   };
   const st = statusLabels[order.status] || { label: order.status, color: 'var(--text2)' };
 
-  const trackingSteps = (order.tracking || []).map((t, i) => `
+  const trackingSteps = (order.tracking || []).map(t => `
     <div class="tracking-step done">
       <div class="tracking-step-dot"></div>
       <div class="tracking-step-title">${t.status}</div>
@@ -1213,43 +1434,54 @@ function renderTracking() {
     </div>
   `).join('');
 
+  const chatBtn = isSeller && buyer ? `
+    <button class="chat-seller-btn" style="margin-top:16px" onclick="openChat('${buyer.id}')">
+      💬 Falar com o comprador (${buyer.username})
+    </button>
+  ` : !isSeller ? `
+    <button class="chat-seller-btn" style="margin-top:16px" onclick="openChat('${order.sellerId}')">
+      💬 Falar com o vendedor
+    </button>
+  ` : '';
+
   const sellerPanel = isSeller ? `
     <div class="divider"></div>
-    <h3 style="font-family:'Bebas Neue',sans-serif;font-size:20px;letter-spacing:2px;margin-bottom:16px">ATUALIZAR RASTREAMENTO</h3>
-    <div class="form-group"><label>Status do pedido</label>
+    <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin-bottom:14px">ATUALIZAR RASTREAMENTO</h3>
+    <div class="form-group"><label>Status</label>
       <select class="form-control" id="track-status">
         <option value="processing" ${order.status === 'processing' ? 'selected' : ''}>⚙ Processando</option>
         <option value="shipped" ${order.status === 'shipped' ? 'selected' : ''}>🚚 Enviado</option>
         <option value="delivered" ${order.status === 'delivered' ? 'selected' : ''}>✅ Entregue</option>
       </select>
     </div>
-    <div class="form-group"><label>Localização atual</label><input class="form-control" id="track-location" placeholder="Ex: Centro de Triagem SP"></div>
+    <div class="form-group"><label>Localização</label><input class="form-control" id="track-location" placeholder="Ex: Centro de Triagem SP"></div>
     <div class="form-group"><label>Descrição</label><input class="form-control" id="track-desc" placeholder="Ex: Produto saiu para entrega"></div>
-    <button class="btn btn-primary" onclick="updateTracking('${order.id}')">Atualizar rastreamento</button>
-  ` : '';
+    <button class="btn btn-primary" onclick="updateTracking('${order.id}')">Atualizar</button>
+    ${chatBtn}
+  ` : chatBtn;
 
   return `
-    <div class="page-container" style="padding-top:32px;max-width:700px;margin:0 auto">
-      <button class="btn btn-outline btn-sm" style="margin-bottom:24px" onclick="history.back()">← Voltar</button>
-      <div style="display:flex;align-items:center;gap:16px;margin-bottom:24px">
-        <img src="${product?.images[0]}" style="width:60px;height:60px;object-fit:cover;border-radius:8px;border:1px solid var(--border)" onerror="this.style.display='none'">
+    <div class="page-container" style="padding-top:24px;max-width:700px;margin:0 auto">
+      <button class="btn btn-outline btn-sm" style="margin-bottom:20px" onclick="history.back()">← Voltar</button>
+      <div style="display:flex;align-items:center;gap:14px;margin-bottom:20px;flex-wrap:wrap">
+        <img src="${product?.images[0]}" style="width:54px;height:54px;object-fit:cover;border-radius:8px;border:1px solid var(--border)" onerror="this.style.display='none'">
         <div>
-          <h2 style="font-family:'Bebas Neue',sans-serif;font-size:24px;letter-spacing:2px">${product?.title || 'Produto'}</h2>
-          <div style="color:${st.color};font-size:14px;font-weight:600;margin-top:4px">${st.label}</div>
+          <h2 style="font-family:'Bebas Neue',sans-serif;font-size:22px;letter-spacing:2px">${product?.title || 'Produto'}</h2>
+          <div style="color:${st.color};font-size:13px;font-weight:600;margin-top:3px">${st.label}</div>
         </div>
-        <div style="margin-left:auto;font-family:'Space Mono',monospace;font-size:20px;font-weight:700">${fmt(order.total)}</div>
+        <div style="margin-left:auto;font-family:'Space Mono',monospace;font-size:18px;font-weight:700">${fmt(order.total)}</div>
       </div>
 
-      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius2);padding:24px;margin-bottom:24px">
-        <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin-bottom:20px">ENDEREÇO DE ENTREGA</h3>
-        <p style="font-size:14px;color:var(--text2)">${order.address.name} • ${order.address.phone}</p>
-        <p style="font-size:14px;color:var(--text2)">${order.address.street}, ${order.address.num} ${order.address.complement ? '— ' + order.address.complement : ''}</p>
-        <p style="font-size:14px;color:var(--text2)">${order.address.neighborhood ? order.address.neighborhood + ', ' : ''}${order.address.city} — ${order.address.state}</p>
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius2);padding:20px;margin-bottom:16px">
+        <h3 style="font-family:'Bebas Neue',sans-serif;font-size:16px;letter-spacing:2px;margin-bottom:14px">ENDEREÇO</h3>
+        <p style="font-size:13px;color:var(--text2)">${order.address.name} • ${order.address.phone}</p>
+        <p style="font-size:13px;color:var(--text2)">${order.address.street}, ${order.address.num}</p>
+        <p style="font-size:13px;color:var(--text2)">${order.address.city} — ${order.address.state}</p>
       </div>
 
-      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius2);padding:24px">
-        <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin-bottom:20px">RASTREAMENTO</h3>
-        <div class="tracking-steps">${trackingSteps || '<p style="color:var(--text3)">Sem atualizações ainda</p>'}</div>
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius2);padding:20px">
+        <h3 style="font-family:'Bebas Neue',sans-serif;font-size:16px;letter-spacing:2px;margin-bottom:16px">RASTREAMENTO</h3>
+        <div class="tracking-steps">${trackingSteps || '<p style="color:var(--text3)">Sem atualizações</p>'}</div>
         ${sellerPanel}
       </div>
     </div>
@@ -1268,19 +1500,10 @@ function updateTracking(orderId) {
   orders[idx].tracking.push({ status: desc, date: new Date().toISOString(), location });
   DB.setOrders(orders);
 
-  // Notify buyer
   const order = orders[idx];
   const notifs = DB.getNotifs();
   const product = DB.getProducts().find(p => p.id === order.productId);
-  notifs.push({
-    id: uid(),
-    userId: order.buyerId,
-    type: 'tracking',
-    message: `📦 Atualização do pedido "${product?.title}": ${desc} — ${location}`,
-    orderId: order.id,
-    read: false,
-    createdAt: new Date().toISOString(),
-  });
+  notifs.push({ id: uid(), userId: order.buyerId, type: 'tracking', message: `📦 Pedido "${product?.title}": ${desc} — ${location}`, orderId: order.id, read: false, createdAt: new Date().toISOString() });
   DB.setNotifs(notifs);
 
   toast('Rastreamento atualizado!', 'success');
@@ -1291,19 +1514,17 @@ function updateTracking(orderId) {
 function renderNotifications() {
   if (!state.user) { showLogin(); return ''; }
   const notifs = DB.getNotifs().filter(n => n.userId === state.user.id).reverse();
-
-  // Mark all as read
   const allNotifs = DB.getNotifs();
   allNotifs.forEach(n => { if (n.userId === state.user.id) n.read = true; });
   DB.setNotifs(allNotifs);
 
   return `
-    <div class="page-container" style="padding-top:32px;max-width:700px;margin:0 auto">
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:32px;letter-spacing:3px;margin-bottom:24px">🔔 NOTIFICAÇÕES</h2>
+    <div class="page-container" style="padding-top:24px;max-width:700px;margin:0 auto">
+      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:20px">🔔 NOTIFICAÇÕES</h2>
       <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius2);overflow:hidden">
         ${notifs.length === 0 ? `<div class="empty-state"><div class="icon">🔔</div><h3>Nenhuma notificação</h3></div>` :
           notifs.map(n => `
-            <div class="notif-item ${n.read ? '' : 'unread'}" onclick="${n.orderId ? `navigate('tracking',{id:'${n.orderId}'})` : ''}">
+            <div class="notif-item ${n.read ? '' : 'unread'}" onclick="${n.orderId ? `navigate('tracking',{id:'${n.orderId}'})` : n.chatRoomId ? `openChat('${n.otherUserId}')` : ''}">
               <div class="notif-dot ${n.read ? 'read' : ''}"></div>
               <div>
                 <div class="notif-text">${n.message}</div>
@@ -1322,8 +1543,8 @@ function renderOrders() {
   if (!state.user) { showLogin(); return ''; }
   const orders = DB.getOrders().filter(o => o.buyerId === state.user.id).reverse();
   return `
-    <div class="page-container" style="padding-top:32px">
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:32px;letter-spacing:3px;margin-bottom:24px">📦 MEUS PEDIDOS</h2>
+    <div class="page-container" style="padding-top:24px">
+      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:20px">📦 MEUS PEDIDOS</h2>
       ${orders.length === 0 ? `<div class="empty-state"><div class="icon">📦</div><h3>Nenhum pedido ainda</h3></div>` :
         orders.map(o => renderOrderCard(o)).join('')}
     </div>
@@ -1335,43 +1556,47 @@ function renderSellerDashboard() {
   if (!state.user?.isSeller) { toast('Acesso negado', 'error'); navigate('home'); return ''; }
   const orders = DB.getOrders().filter(o => o.sellerId === state.user.id);
   const products = DB.getProducts().filter(p => p.sellerId === state.user.id);
-  const totalRevenue = orders.filter(o => o.status !== 'pending_payment' && o.status !== 'cancelled').reduce((a, o) => a + o.total, 0);
+  const totalRevenue = orders.filter(o => o.status !== 'pending_payment').reduce((a, o) => a + o.total, 0);
   const notifs = DB.getNotifs().filter(n => n.userId === state.user.id && !n.read).length;
 
+  // Count unread chats
+  const chatUnread = getUnreadChatCount();
+
   return `
-    <div class="page-container" style="padding-top:32px">
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:32px;letter-spacing:3px;margin-bottom:8px">PAINEL DO VENDEDOR</h2>
-      <p style="color:var(--text3);margin-bottom:32px">Olá, ${state.user.username}!</p>
+    <div class="page-container" style="padding-top:24px">
+      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:6px">PAINEL DO VENDEDOR</h2>
+      <p style="color:var(--text3);margin-bottom:24px">Olá, ${state.user.username}!</p>
 
       <div class="dash-grid">
         <div class="dash-card">
           <div class="num">${products.length}</div>
-          <div class="label">Produtos ativos</div>
+          <div class="label">Produtos</div>
         </div>
         <div class="dash-card">
           <div class="num">${orders.length}</div>
-          <div class="label">Total de pedidos</div>
+          <div class="label">Pedidos</div>
         </div>
         <div class="dash-card">
-          <div class="num">${fmt(totalRevenue)}</div>
-          <div class="label">Receita total</div>
+          <div class="num" style="font-size:24px">${fmt(totalRevenue)}</div>
+          <div class="label">Receita</div>
         </div>
         <div class="dash-card">
           <div class="num">${notifs}</div>
-          <div class="label">Notificações novas</div>
+          <div class="label">Notificações</div>
         </div>
       </div>
 
-      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;margin-bottom:32px">
-        <button class="btn btn-primary" onclick="navigate('add-product')">+ Anunciar produto</button>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;margin-bottom:28px" class="dash-btns-grid">
+        <button class="btn btn-primary" onclick="navigate('add-product')">+ Anunciar</button>
         <button class="btn btn-outline" onclick="navigate('seller-products')">Meus produtos</button>
         <button class="btn btn-outline" onclick="navigate('seller-coupons')">Cupons</button>
-        <button class="btn btn-outline" onclick="navigate('notifications')">🔔 Notificações ${notifs > 0 ? `(${notifs})` : ''}</button>
+        <button class="btn btn-outline" onclick="navigate('my-chats')">💬 Chats ${chatUnread > 0 ? `(${chatUnread})` : ''}</button>
+        <button class="btn btn-outline" onclick="navigate('notifications')">🔔 ${notifs > 0 ? `(${notifs})` : 'Notifs'}</button>
       </div>
 
-      <h3 style="font-family:'Bebas Neue',sans-serif;font-size:20px;letter-spacing:2px;margin-bottom:16px">PEDIDOS RECENTES</h3>
+      <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin-bottom:14px">PEDIDOS RECENTES</h3>
       ${orders.length === 0 ? `<div class="empty-state"><div class="icon">📦</div><h3>Nenhum pedido ainda</h3></div>` :
-        orders.reverse().slice(0, 5).map(o => {
+        [...orders].reverse().slice(0, 5).map(o => {
           const product = DB.getProducts().find(p => p.id === o.productId);
           const buyer = DB.getUsers().find(u => u.id === o.buyerId);
           return `
@@ -1379,10 +1604,10 @@ function renderSellerDashboard() {
               <img class="cart-item-img" src="${product?.images[0]}" onerror="this.src='https://via.placeholder.com/80x80/111/444?text=?'">
               <div class="cart-item-info">
                 <div class="cart-item-title">${product?.title || 'Produto'}</div>
-                <div style="font-size:12px;color:var(--text3)">Cliente: ${buyer?.username || 'Comprador'} • ${timeAgo(o.createdAt)}</div>
+                <div style="font-size:11px;color:var(--text3)">${buyer?.username || 'Comprador'} • ${timeAgo(o.createdAt)}</div>
                 <div class="cart-item-price">${fmt(o.total)}</div>
               </div>
-              <div style="font-size:13px;color:var(--text2)">${o.status}</div>
+              <div style="font-size:12px;color:var(--text2)">${o.status}</div>
             </div>
           `;
         }).join('')
@@ -1397,23 +1622,23 @@ function renderSellerProducts() {
   const products = DB.getProducts().filter(p => p.sellerId === state.user.id);
 
   return `
-    <div class="page-container" style="padding-top:32px">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px">
-        <h2 style="font-family:'Bebas Neue',sans-serif;font-size:32px;letter-spacing:3px">MEUS PRODUTOS</h2>
-        <button class="btn btn-primary" onclick="navigate('add-product')">+ Novo produto</button>
+    <div class="page-container" style="padding-top:24px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:12px">
+        <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px">MEUS PRODUTOS</h2>
+        <button class="btn btn-primary btn-sm" onclick="navigate('add-product')">+ Novo</button>
       </div>
-      ${products.length === 0 ? `<div class="empty-state"><div class="icon">📦</div><h3>Nenhum produto ainda</h3><button class="btn btn-primary" onclick="navigate('add-product')" style="margin-top:16px">Anunciar produto</button></div>` :
-        `<div style="display:grid;gap:12px">
+      ${products.length === 0 ? `<div class="empty-state"><div class="icon">📦</div><h3>Nenhum produto ainda</h3><button class="btn btn-primary" onclick="navigate('add-product')" style="margin-top:14px">Anunciar produto</button></div>` :
+        `<div style="display:grid;gap:10px">
           ${products.map(p => `
-            <div style="display:flex;gap:16px;padding:16px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);align-items:center">
-              <img src="${p.images[0]}" style="width:64px;height:64px;object-fit:cover;border-radius:8px;border:1px solid var(--border)" onerror="this.src='https://via.placeholder.com/64x64/111/444?text=?'">
-              <div style="flex:1">
-                <div style="font-size:14px;font-weight:600">${p.title}</div>
-                <div style="font-size:13px;color:var(--text3)">${fmt(p.price)} • ${p.stock} em estoque • ${p.sold||0} vendidos</div>
+            <div style="display:flex;gap:14px;padding:14px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);align-items:center">
+              <img src="${p.images[0]}" style="width:56px;height:56px;object-fit:cover;border-radius:8px;border:1px solid var(--border);flex-shrink:0" onerror="this.src='https://via.placeholder.com/64x64/111/444?text=?'">
+              <div style="flex:1;min-width:0">
+                <div style="font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.title}</div>
+                <div style="font-size:12px;color:var(--text3)">${fmt(p.price)} • ${p.stock} estoque • ${p.sold||0} vendidos</div>
               </div>
-              <div style="display:flex;gap:8px">
+              <div style="display:flex;gap:6px;flex-shrink:0">
                 <button class="btn btn-outline btn-sm" onclick="navigate('edit-product',{id:'${p.id}'})">Editar</button>
-                <button class="btn btn-sm" style="background:none;border:1px solid var(--danger);color:var(--danger)" onclick="deleteProduct('${p.id}')">Excluir</button>
+                <button class="btn btn-sm" style="background:none;border:1px solid var(--danger);color:var(--danger);padding:8px 10px" onclick="deleteProduct('${p.id}')">×</button>
               </div>
             </div>
           `).join('')}
@@ -1430,40 +1655,34 @@ function deleteProduct(id) {
   render();
 }
 
-// ─── ADD PRODUCT ──────────────────────────────────────────────
+// ─── ADD/EDIT PRODUCT ──────────────────────────────────────────
 function renderAddProduct() {
   if (!state.user?.isSeller) { navigate('home'); return ''; }
   return `
-    <div class="page-container" style="padding-top:32px;max-width:680px;margin:0 auto">
-      <button class="btn btn-outline btn-sm" style="margin-bottom:24px" onclick="history.back()">← Voltar</button>
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:32px;letter-spacing:3px;margin-bottom:24px">ANUNCIAR PRODUTO</h2>
+    <div class="page-container" style="padding-top:24px;max-width:680px;margin:0 auto">
+      <button class="btn btn-outline btn-sm" style="margin-bottom:20px" onclick="history.back()">← Voltar</button>
+      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:20px">ANUNCIAR PRODUTO</h2>
       <div class="form-group"><label>Título *</label><input class="form-control" id="prod-title" placeholder="Nome do produto"></div>
-      <div class="form-group"><label>Descrição *</label><textarea class="form-control" id="prod-desc" placeholder="Descreva o produto..." style="min-height:120px"></textarea></div>
+      <div class="form-group"><label>Descrição *</label><textarea class="form-control" id="prod-desc" placeholder="Descreva o produto..." style="min-height:100px"></textarea></div>
       <div class="two-col">
-        <div class="form-group"><label>Preço (R$) *</label><input class="form-control" id="prod-price" type="number" step="0.01" placeholder="0,00"></div>
-        <div class="form-group"><label>Preço original (opcional)</label><input class="form-control" id="prod-orig" type="number" step="0.01" placeholder="0,00"></div>
+        <div class="form-group"><label>Preço (R$) *</label><input class="form-control" id="prod-price" type="number" step="0.01" inputmode="decimal"></div>
+        <div class="form-group"><label>Preço original</label><input class="form-control" id="prod-orig" type="number" step="0.01" inputmode="decimal"></div>
       </div>
       <div class="two-col">
-        <div class="form-group"><label>Estoque *</label><input class="form-control" id="prod-stock" type="number" placeholder="0"></div>
+        <div class="form-group"><label>Estoque *</label><input class="form-control" id="prod-stock" type="number" inputmode="numeric"></div>
         <div class="form-group"><label>Categoria *</label>
           <select class="form-control" id="prod-cat">
-            <option value="moda">Moda</option>
-            <option value="eletronicos">Eletrônicos</option>
-            <option value="acessorios">Acessórios</option>
-            <option value="bolsas">Bolsas</option>
-            <option value="beleza">Beleza</option>
-            <option value="casa">Casa</option>
-            <option value="esporte">Esporte</option>
+            ${['moda','eletronicos','acessorios','bolsas','beleza','casa','esporte'].map(c => `<option value="${c}">${c}</option>`).join('')}
           </select>
         </div>
       </div>
       <div class="form-group">
-        <label>Imagens (URLs, uma por linha)</label>
-        <textarea class="form-control" id="prod-images" placeholder="https://exemplo.com/imagem.jpg&#10;https://exemplo.com/imagem2.jpg" style="min-height:80px"></textarea>
+        <label>Imagens (URLs)</label>
+        <textarea class="form-control" id="prod-images" placeholder="https://exemplo.com/imagem.jpg&#10;Uma URL por linha" style="min-height:70px"></textarea>
       </div>
       <div class="form-group">
-        <label>Ou faça upload de imagens</label>
-        <label class="btn btn-outline" for="prod-img-upload" style="cursor:pointer;display:inline-flex">📎 Selecionar imagens</label>
+        <label>Upload de imagens</label>
+        <label class="btn btn-outline" for="prod-img-upload" style="cursor:pointer;display:inline-flex">📎 Selecionar</label>
         <input type="file" id="prod-img-upload" accept="image/*" multiple onchange="handleImageUpload(event)">
         <div class="img-preview-grid" id="img-previews"></div>
       </div>
@@ -1478,14 +1697,12 @@ function handleImageUpload(event) {
   const files = Array.from(event.target.files);
   const previewContainer = document.getElementById('img-previews');
   uploadedImages = [];
-
   files.forEach(file => {
     const reader = new FileReader();
     reader.onload = function(e) {
       uploadedImages.push(e.target.result);
       const img = document.createElement('img');
-      img.className = 'img-preview';
-      img.src = e.target.result;
+      img.className = 'img-preview'; img.src = e.target.result;
       previewContainer.appendChild(img);
     };
     reader.readAsDataURL(file);
@@ -1513,20 +1730,7 @@ function saveProduct(editId = null) {
       toast('Produto atualizado!', 'success');
     }
   } else {
-    const product = {
-      id: uid(),
-      sellerId: state.user.id,
-      title,
-      description: desc,
-      price,
-      originalPrice: origPrice,
-      stock,
-      category,
-      images: allImages.length > 0 ? allImages : [`https://via.placeholder.com/400x400/111111/444444?text=${encodeURIComponent(title)}`],
-      sold: 0,
-      createdAt: new Date().toISOString(),
-    };
-    products.push(product);
+    products.push({ id: uid(), sellerId: state.user.id, title, description: desc, price, originalPrice: origPrice, stock, category, images: allImages.length > 0 ? allImages : [`https://via.placeholder.com/400x400/111111/444444?text=${encodeURIComponent(title)}`], sold: 0, createdAt: new Date().toISOString() });
     DB.setProducts(products);
     toast('Produto publicado!', 'success');
   }
@@ -1534,24 +1738,23 @@ function saveProduct(editId = null) {
   navigate('seller-products');
 }
 
-// ─── EDIT PRODUCT ─────────────────────────────────────────────
 function renderEditProduct() {
   if (!state.user?.isSeller) { navigate('home'); return ''; }
   const p = DB.getProducts().find(p => p.id === state.params.id);
   if (!p) return `<div class="page-container"><div class="empty-state"><h3>Produto não encontrado</h3></div></div>`;
 
   return `
-    <div class="page-container" style="padding-top:32px;max-width:680px;margin:0 auto">
-      <button class="btn btn-outline btn-sm" style="margin-bottom:24px" onclick="history.back()">← Voltar</button>
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:32px;letter-spacing:3px;margin-bottom:24px">EDITAR PRODUTO</h2>
+    <div class="page-container" style="padding-top:24px;max-width:680px;margin:0 auto">
+      <button class="btn btn-outline btn-sm" style="margin-bottom:20px" onclick="history.back()">← Voltar</button>
+      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:20px">EDITAR PRODUTO</h2>
       <div class="form-group"><label>Título *</label><input class="form-control" id="prod-title" value="${p.title}"></div>
-      <div class="form-group"><label>Descrição *</label><textarea class="form-control" id="prod-desc" style="min-height:120px">${p.description}</textarea></div>
+      <div class="form-group"><label>Descrição *</label><textarea class="form-control" id="prod-desc" style="min-height:100px">${p.description}</textarea></div>
       <div class="two-col">
-        <div class="form-group"><label>Preço (R$) *</label><input class="form-control" id="prod-price" type="number" step="0.01" value="${p.price}"></div>
-        <div class="form-group"><label>Preço original</label><input class="form-control" id="prod-orig" type="number" step="0.01" value="${p.originalPrice || ''}"></div>
+        <div class="form-group"><label>Preço *</label><input class="form-control" id="prod-price" type="number" step="0.01" value="${p.price}" inputmode="decimal"></div>
+        <div class="form-group"><label>Original</label><input class="form-control" id="prod-orig" type="number" step="0.01" value="${p.originalPrice || ''}" inputmode="decimal"></div>
       </div>
       <div class="two-col">
-        <div class="form-group"><label>Estoque *</label><input class="form-control" id="prod-stock" type="number" value="${p.stock}"></div>
+        <div class="form-group"><label>Estoque *</label><input class="form-control" id="prod-stock" type="number" value="${p.stock}" inputmode="numeric"></div>
         <div class="form-group"><label>Categoria *</label>
           <select class="form-control" id="prod-cat">
             ${['moda','eletronicos','acessorios','bolsas','beleza','casa','esporte'].map(c => `<option value="${c}" ${p.category===c?'selected':''}>${c}</option>`).join('')}
@@ -1559,12 +1762,12 @@ function renderEditProduct() {
         </div>
       </div>
       <div class="form-group">
-        <label>Imagens (URLs, uma por linha)</label>
-        <textarea class="form-control" id="prod-images" style="min-height:80px">${p.images.filter(i => i.startsWith('http')).join('\n')}</textarea>
+        <label>Imagens (URLs)</label>
+        <textarea class="form-control" id="prod-images" style="min-height:70px">${p.images.filter(i => i.startsWith('http')).join('\n')}</textarea>
       </div>
       <div class="form-group">
-        <label>Upload de imagens</label>
-        <label class="btn btn-outline" for="prod-img-upload" style="cursor:pointer;display:inline-flex">📎 Selecionar imagens</label>
+        <label>Upload</label>
+        <label class="btn btn-outline" for="prod-img-upload" style="cursor:pointer;display:inline-flex">📎 Selecionar</label>
         <input type="file" id="prod-img-upload" accept="image/*" multiple onchange="handleImageUpload(event)">
         <div class="img-preview-grid" id="img-previews">
           ${p.images.map(img => `<img class="img-preview" src="${img}" onerror="this.style.display='none'">`).join('')}
@@ -1581,21 +1784,19 @@ function renderSellerCoupons() {
   const coupons = DB.getCoupons().filter(c => c.sellerId === state.user.id);
 
   return `
-    <div class="page-container" style="padding-top:32px">
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:32px;letter-spacing:3px;margin-bottom:24px">CUPONS DE DESCONTO</h2>
-
-      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius2);padding:24px;margin-bottom:32px;max-width:480px">
-        <h3 style="font-family:'Bebas Neue',sans-serif;font-size:20px;letter-spacing:2px;margin-bottom:20px">CRIAR CUPOM</h3>
-        <div class="form-group"><label>Código do cupom *</label><input class="form-control" id="coupon-code" placeholder="EX: DESCONTO10" style="text-transform:uppercase"></div>
+    <div class="page-container" style="padding-top:24px">
+      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:20px">CUPONS</h2>
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius2);padding:20px;margin-bottom:24px;max-width:480px">
+        <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin-bottom:16px">CRIAR CUPOM</h3>
+        <div class="form-group"><label>Código *</label><input class="form-control" id="coupon-code" placeholder="DESCONTO10" style="text-transform:uppercase"></div>
         <div class="two-col">
-          <div class="form-group"><label>Desconto (%) *</label><input class="form-control" id="coupon-discount" type="number" min="1" max="100" placeholder="10"></div>
-          <div class="form-group"><label>Usos máximos *</label><input class="form-control" id="coupon-uses" type="number" min="1" placeholder="100"></div>
+          <div class="form-group"><label>Desconto (%) *</label><input class="form-control" id="coupon-discount" type="number" min="1" max="100" inputmode="numeric"></div>
+          <div class="form-group"><label>Usos máximos *</label><input class="form-control" id="coupon-uses" type="number" min="1" inputmode="numeric"></div>
         </div>
         <div class="form-group"><label>Descrição</label><input class="form-control" id="coupon-desc" placeholder="Ex: 10% na primeira compra"></div>
         <button class="btn btn-primary btn-full" onclick="createCoupon()">Criar cupom</button>
       </div>
 
-      <h3 style="font-family:'Bebas Neue',sans-serif;font-size:20px;letter-spacing:2px;margin-bottom:16px">MEUS CUPONS</h3>
       ${coupons.length === 0 ? `<div class="empty-state"><div class="icon">🏷</div><h3>Nenhum cupom criado</h3></div>` :
         coupons.map(c => `
           <div class="coupon-card">
@@ -1604,7 +1805,7 @@ function renderSellerCoupons() {
               <div class="coupon-info">${c.description || ''} • ${c.uses}/${c.maxUses} usos</div>
             </div>
             <div class="coupon-discount">${c.discount}%</div>
-            <div style="display:flex;flex-direction:column;gap:6px">
+            <div style="display:flex;flex-direction:column;gap:5px">
               <span class="chip" style="${c.active ? 'color:var(--success);border-color:rgba(68,255,136,0.3)' : 'color:var(--danger);border-color:rgba(255,68,68,0.3)'}">${c.active ? 'Ativo' : 'Inativo'}</span>
               <button class="btn btn-outline btn-sm" onclick="toggleCoupon('${c.id}')">${c.active ? 'Desativar' : 'Ativar'}</button>
               <button class="btn btn-sm" style="background:none;border:1px solid var(--danger);color:var(--danger)" onclick="deleteCoupon('${c.id}')">Excluir</button>
@@ -1621,26 +1822,11 @@ function createCoupon() {
   const discount = parseInt(document.getElementById('coupon-discount')?.value);
   const maxUses = parseInt(document.getElementById('coupon-uses')?.value);
   const description = document.getElementById('coupon-desc')?.value?.trim();
-
   if (!code || !discount || !maxUses) { toast('Preencha todos os campos', 'error'); return; }
   if (discount < 1 || discount > 100) { toast('Desconto deve ser entre 1% e 100%', 'error'); return; }
-
   const coupons = DB.getCoupons();
-  if (coupons.find(c => c.code === code && c.sellerId === state.user.id)) {
-    toast('Código já existe', 'error'); return;
-  }
-
-  coupons.push({
-    id: uid(),
-    sellerId: state.user.id,
-    code,
-    discount,
-    maxUses,
-    uses: 0,
-    description,
-    active: true,
-    createdAt: new Date().toISOString(),
-  });
+  if (coupons.find(c => c.code === code && c.sellerId === state.user.id)) { toast('Código já existe', 'error'); return; }
+  coupons.push({ id: uid(), sellerId: state.user.id, code, discount, maxUses, uses: 0, description, active: true, createdAt: new Date().toISOString() });
   DB.setCoupons(coupons);
   toast(`Cupom ${code} criado!`, 'success');
   render();
@@ -1665,25 +1851,23 @@ function renderAdminUsers() {
   const users = DB.getUsers().filter(u => !u.isAdmin);
 
   return `
-    <div class="page-container" style="padding-top:32px">
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:32px;letter-spacing:3px;margin-bottom:8px">GERENCIAR USUÁRIOS</h2>
-      <p style="color:var(--text3);margin-bottom:24px">Promova usuários a vendedores</p>
+    <div class="page-container" style="padding-top:24px">
+      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:6px">USUÁRIOS</h2>
+      <p style="color:var(--text3);margin-bottom:20px">Promova usuários a vendedores</p>
       <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius2);overflow:hidden">
-        ${users.length === 0 ? `<div class="empty-state"><div class="icon">👥</div><h3>Nenhum usuário cadastrado</h3></div>` :
+        ${users.length === 0 ? `<div class="empty-state"><div class="icon">👥</div><h3>Nenhum usuário</h3></div>` :
           users.map(u => `
             <div class="user-row">
               <img class="user-row-avatar" src="${u.avatar}" alt="${u.username}" onerror="this.src='https://api.dicebear.com/7.x/initials/svg?seed=${u.username}'">
               <div class="user-row-name">
                 <div style="font-weight:600">${u.username}</div>
-                <div style="font-size:12px;color:var(--text3)">${u.email || ''}</div>
+                <div style="font-size:11px;color:var(--text3)">${u.email || ''}</div>
               </div>
               <span class="role-badge ${u.isSeller ? 'seller' : ''}">${u.isSeller ? 'Vendedor' : 'Comprador'}</span>
-              <div style="display:flex;gap:8px;margin-left:16px">
-                ${u.isSeller ?
-                  `<button class="btn btn-outline btn-sm" style="border-color:var(--danger);color:var(--danger)" onclick="demoteSeller('${u.id}')">Remover vendedor</button>` :
-                  `<button class="btn btn-outline btn-sm" style="border-color:var(--success);color:var(--success)" onclick="promoteSeller('${u.id}')">Promover a vendedor</button>`
-                }
-              </div>
+              ${u.isSeller ?
+                `<button class="btn btn-outline btn-sm" style="border-color:var(--danger);color:var(--danger)" onclick="demoteSeller('${u.id}')">Remover</button>` :
+                `<button class="btn btn-outline btn-sm" style="border-color:var(--success);color:var(--success)" onclick="promoteSeller('${u.id}')">Promover</button>`
+              }
             </div>
           `).join('')
         }
@@ -1698,20 +1882,10 @@ function promoteSeller(userId) {
   if (idx < 0) return;
   users[idx].isSeller = true;
   DB.setUsers(users);
-
-  // Notify user
   const notifs = DB.getNotifs();
-  notifs.push({
-    id: uid(),
-    userId,
-    type: 'promotion',
-    message: '🎉 Parabéns! Você foi promovido a vendedor no REDZIN MARKET! Agora você pode anunciar produtos e criar cupons.',
-    read: false,
-    createdAt: new Date().toISOString(),
-  });
+  notifs.push({ id: uid(), userId, type: 'promotion', message: '🎉 Parabéns! Você foi promovido a vendedor no REDZIN MARKET!', read: false, createdAt: new Date().toISOString() });
   DB.setNotifs(notifs);
-
-  toast(`${users[idx].username} é agora um vendedor!`, 'success');
+  toast(`${users[idx].username} agora é vendedor!`, 'success');
   render();
 }
 
@@ -1722,7 +1896,7 @@ function demoteSeller(userId) {
   if (idx < 0) return;
   users[idx].isSeller = false;
   DB.setUsers(users);
-  toast('Status de vendedor removido', 'info');
+  toast('Status removido', 'info');
   render();
 }
 

@@ -2,7 +2,11 @@
 <html lang="pt-BR">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#000000">
   <title>REDZIN MARKET — Black & White Store</title>
   <link rel="stylesheet" href="styles.css">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
@@ -17,10 +21,65 @@
     <button class="nav-search-btn" onclick="searchProducts()">Buscar</button>
   </div>
   <div class="nav-actions" id="nav-actions"></div>
+  <!-- Mobile search toggle -->
+  <button class="mobile-search-btn" onclick="toggleMobileSearch()">🔍</button>
 </nav>
+
+<!-- MOBILE SEARCH BAR -->
+<div class="mobile-search-bar" id="mobile-search-bar">
+  <input type="text" id="mobile-search-input" placeholder="Buscar produtos..." onkeydown="if(event.key==='Enter') mobileSearch()">
+  <button onclick="mobileSearch()">Buscar</button>
+</div>
 
 <!-- MAIN -->
 <div id="main"></div>
+
+<!-- BOTTOM NAV (mobile only) -->
+<nav class="bottom-nav" id="bottom-nav">
+  <button class="bottom-nav-btn" onclick="navigate('home')" id="bnav-home">
+    <span class="bnav-icon">🏠</span>
+    <span class="bnav-label">Início</span>
+  </button>
+  <button class="bottom-nav-btn" onclick="toggleMobileSearch()" id="bnav-search">
+    <span class="bnav-icon">🔍</span>
+    <span class="bnav-label">Buscar</span>
+  </button>
+  <button class="bottom-nav-btn" id="bnav-cart" onclick="navigate('cart')">
+    <span class="bnav-icon">🛒</span>
+    <span class="bnav-label">Carrinho</span>
+    <span class="bnav-badge" id="bnav-cart-badge" style="display:none"></span>
+  </button>
+  <button class="bottom-nav-btn" id="bnav-chat" onclick="navigate('my-chats')">
+    <span class="bnav-icon">💬</span>
+    <span class="bnav-label">Chat</span>
+    <span class="bnav-badge" id="bnav-chat-badge" style="display:none"></span>
+  </button>
+  <button class="bottom-nav-btn" id="bnav-profile" onclick="handleProfileNav()">
+    <span class="bnav-icon">👤</span>
+    <span class="bnav-label">Perfil</span>
+  </button>
+</nav>
+
+<!-- CHAT PANEL -->
+<div class="chat-panel" id="chat-panel">
+  <div class="chat-panel-header">
+    <button class="chat-back-btn" onclick="closeChatPanel()">←</button>
+    <div class="chat-panel-user">
+      <img id="chat-panel-avatar" src="" alt="">
+      <div>
+        <div id="chat-panel-name">Chat</div>
+        <div id="chat-panel-status" class="chat-status">online</div>
+      </div>
+    </div>
+    <button class="chat-close-btn" onclick="closeChatPanel()">×</button>
+  </div>
+  <div class="chat-messages" id="chat-messages"></div>
+  <div class="chat-input-area">
+    <input type="text" id="chat-input" class="chat-input" placeholder="Digite uma mensagem..." onkeydown="if(event.key==='Enter') sendChatMessage()">
+    <button class="chat-send-btn" onclick="sendChatMessage()">➤</button>
+  </div>
+</div>
+<div class="chat-overlay" id="chat-overlay" onclick="closeChatPanel()"></div>
 
 <!-- TOAST CONTAINER -->
 <div id="toast-container"></div>
