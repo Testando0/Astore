@@ -1,5 +1,5 @@
 // ============================================================
-// REDZIN MARKET — Full E-Commerce App with WebSocket Chat
+// REDZIN MARKET — Full E-Commerce App
 // ============================================================
 
 // ─── DATABASE (localStorage) ─────────────────────────────────
@@ -22,7 +22,6 @@ const DB = {
   setNotifs: v => DB.set('rm_notifs', v),
   getCurrent: () => DB.get('rm_current', null),
   setCurrent: v => DB.set('rm_current', v),
-  // ── CHAT ──
   getChats: () => DB.get('rm_chats', {}),
   setChats: v => DB.set('rm_chats', v),
   getChatRoom: (roomId) => {
@@ -45,6 +44,9 @@ let chatState = {
   lastMsgCount: 0,
 };
 
+// ─── GLOBAL ORDER DATA (fixes inline JSON onclick bug) ────────
+let _pendingOrderData = null;
+
 // ─── STATE ───────────────────────────────────────────────────
 let state = {
   route: 'home',
@@ -56,7 +58,6 @@ let state = {
 
 // ─── INIT ────────────────────────────────────────────────────
 function init() {
-  // Seed admin user Redzin
   let users = DB.getUsers();
   if (!users.find(u => u.username === 'Redzin')) {
     users.push({
@@ -70,6 +71,8 @@ function init() {
       isAdmin: true,
       createdAt: new Date().toISOString(),
       bio: 'Vendedor Oficial REDZIN MARKET',
+      pixKey: 'redzin@market.com',
+      pixKeyType: 'email',
     });
     DB.setUsers(users);
   }
@@ -80,19 +83,43 @@ function init() {
   hashRoute();
   window.addEventListener('hashchange', hashRoute);
   renderNav();
-  updateBottomNav();
 
-  // Start chat poll (simulates WebSocket)
   startChatPoll();
 
-  // Listen for localStorage changes (cross-tab "WebSocket" simulation)
   window.addEventListener('storage', (e) => {
     if (e.key === 'rm_chats' && chatState.open && chatState.roomId) {
       renderChatMessages();
-      checkUnreadChats();
+      checkUnreadBadges();
     }
-    if (e.key === 'rm_chats') checkUnreadChats();
+    if (e.key === 'rm_chats') checkUnreadBadges();
   });
+
+  // Close dropdown on outside click
+  document.addEventListener('click', (e) => {
+    const wrap = document.getElementById('user-bubble-wrap');
+    if (wrap && !wrap.contains(e.target)) {
+      closeUserMenu();
+    }
+    // Close search bar on outside click
+    const bar = document.getElementById('mobile-search-bar');
+    const btn = document.getElementById('search-toggle-btn');
+    if (bar && bar.classList.contains('visible') && !bar.contains(e.target) && !btn.contains(e.target)) {
+      bar.classList.remove('visible');
+    }
+  });
+
+  // Handle viewport resize (keyboard open/close on mobile)
+  window.addEventListener('resize', handleViewportResize);
+}
+
+function handleViewportResize() {
+  if (chatState.open) {
+    const panel = document.getElementById('chat-panel');
+    if (panel && window.innerWidth <= 640) {
+      const navH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--nav-h')) || 52;
+      panel.style.height = `${window.innerHeight - navH}px`;
+    }
+  }
 }
 
 function seedProducts() {
@@ -156,7 +183,7 @@ function navigate(route, params = {}) {
   history.pushState(null, '', hash);
   render();
   window.scrollTo(0, 0);
-  updateBottomNavActive(route);
+  closeUserMenu();
 }
 
 function hashRoute() {
@@ -165,14 +192,6 @@ function hashRoute() {
   state.route = parts[0];
   state.params = parts[1] ? { id: parts[1] } : {};
   render();
-  updateBottomNavActive(state.route);
-}
-
-function searchProducts() {
-  const q = document.getElementById('search-input')?.value || '';
-  state.searchQuery = q.trim();
-  state.route = 'home';
-  render();
 }
 
 function toggleMobileSearch() {
@@ -180,10 +199,6 @@ function toggleMobileSearch() {
   bar.classList.toggle('visible');
   if (bar.classList.contains('visible')) {
     document.getElementById('mobile-search-input')?.focus();
-    // adjust main padding when search bar visible
-    document.getElementById('main').style.paddingTop = `calc(var(--nav-h) + 56px)`;
-  } else {
-    document.getElementById('main').style.paddingTop = '';
   }
 }
 
@@ -191,12 +206,8 @@ function mobileSearch() {
   const q = document.getElementById('mobile-search-input')?.value || '';
   state.searchQuery = q.trim();
   state.route = 'home';
-  // sync desktop input
-  const di = document.getElementById('search-input');
-  if (di) di.value = q;
   const bar = document.getElementById('mobile-search-bar');
   bar.classList.remove('visible');
-  document.getElementById('main').style.paddingTop = '';
   render();
 }
 
@@ -205,43 +216,51 @@ function handleProfileNav() {
   else showLogin();
 }
 
-function updateBottomNav() {
-  const u = state.user;
-  const cartCount = u ? DB.getCart().filter(c => c.userId === u.id).length : 0;
-  const badge = document.getElementById('bnav-cart-badge');
-  if (badge) {
-    badge.textContent = cartCount;
-    badge.style.display = cartCount > 0 ? 'flex' : 'none';
+// ─── USER MENU DROPDOWN ───────────────────────────────────────
+function toggleUserMenu() {
+  const dropdown = document.getElementById('user-dropdown');
+  if (!dropdown) return;
+  const isOpen = dropdown.style.display !== 'none';
+  if (isOpen) {
+    closeUserMenu();
+  } else {
+    openUserMenu();
   }
-  checkUnreadChats();
 }
 
-function updateBottomNavActive(route) {
-  document.querySelectorAll('.bottom-nav-btn').forEach(b => b.classList.remove('active'));
-  const map = { home: 'bnav-home', cart: 'bnav-cart', 'my-chats': 'bnav-chat', profile: 'bnav-profile' };
-  const id = map[route];
-  if (id) document.getElementById(id)?.classList.add('active');
+function openUserMenu() {
+  const dropdown = document.getElementById('user-dropdown');
+  if (dropdown) {
+    dropdown.style.display = 'block';
+    dropdown.style.animation = 'fadeScale 0.15s ease';
+  }
 }
 
-function checkUnreadChats() {
+function closeUserMenu() {
+  const dropdown = document.getElementById('user-dropdown');
+  if (dropdown) dropdown.style.display = 'none';
+}
+
+// ─── CHAT BADGE / UNREAD ──────────────────────────────────────
+function checkUnreadBadges() {
   if (!state.user) return;
   const chats = DB.getChats();
   let unread = 0;
-  Object.entries(chats).forEach(([roomId, room]) => {
+  Object.entries(chats).forEach(([, room]) => {
     if (!room.participants?.includes(state.user.id)) return;
     (room.messages || []).forEach(m => {
       if (m.senderId !== state.user.id && !m.read) unread++;
     });
   });
-  const badge = document.getElementById('bnav-chat-badge');
-  if (badge) {
-    badge.textContent = unread;
-    badge.style.display = unread > 0 ? 'flex' : 'none';
+  // Update dropdown badge
+  const chatBadgeEl = document.getElementById('dd-chat-badge');
+  if (chatBadgeEl) {
+    chatBadgeEl.textContent = unread;
+    chatBadgeEl.style.display = unread > 0 ? 'inline-flex' : 'none';
   }
 }
 
 // ─── CHAT SYSTEM ─────────────────────────────────────────────
-
 function getChatRoomId(userId1, userId2) {
   return [userId1, userId2].sort().join('__');
 }
@@ -257,12 +276,10 @@ function openChat(otherUserId, productContext = null) {
   chatState.roomId = roomId;
   chatState.otherUserId = otherUserId;
 
-  // Init room if not exists
   let room = DB.getChatRoom(roomId);
   if (!room.participants || room.participants.length === 0) {
     room.participants = [state.user.id, otherUserId];
     room.messages = [];
-    // Add product context message
     if (productContext) {
       room.messages.push({
         id: uid(),
@@ -275,26 +292,39 @@ function openChat(otherUserId, productContext = null) {
     DB.setChatRoom(roomId, room);
   }
 
-  // Update panel header
   document.getElementById('chat-panel-avatar').src = otherUser.avatar || '';
   document.getElementById('chat-panel-name').textContent = otherUser.username;
   document.getElementById('chat-panel-status').textContent = 'online';
 
-  // Open panel
   const panel = document.getElementById('chat-panel');
   const overlay = document.getElementById('chat-overlay');
   panel.classList.add('open');
   overlay.classList.add('visible');
   chatState.open = true;
 
+  // Resize panel properly on mobile
+  if (window.innerWidth <= 640) {
+    const navH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--nav-h')) || 52;
+    panel.style.height = `${window.innerHeight - navH}px`;
+  }
+
   renderChatMessages();
-  setTimeout(() => document.getElementById('chat-input')?.focus(), 300);
+  setTimeout(() => {
+    const input = document.getElementById('chat-input');
+    if (input) {
+      input.focus();
+      // Scroll to bottom of messages
+      const msgs = document.getElementById('chat-messages');
+      if (msgs) msgs.scrollTop = msgs.scrollHeight;
+    }
+  }, 350);
 }
 
 function closeChatPanel() {
   const panel = document.getElementById('chat-panel');
   const overlay = document.getElementById('chat-overlay');
   panel.classList.remove('open');
+  panel.style.height = '';
   overlay.classList.remove('visible');
   chatState.open = false;
   chatState.roomId = null;
@@ -303,7 +333,8 @@ function closeChatPanel() {
 function sendChatMessage() {
   if (!state.user || !chatState.roomId) return;
   const input = document.getElementById('chat-input');
-  const text = input?.value?.trim();
+  if (!input) return;
+  const text = input.value.trim();
   if (!text) return;
 
   const room = DB.getChatRoom(chatState.roomId);
@@ -320,7 +351,6 @@ function sendChatMessage() {
   input.value = '';
   renderChatMessages();
 
-  // Notify other user
   const notifs = DB.getNotifs();
   notifs.push({
     id: uid(),
@@ -333,9 +363,6 @@ function sendChatMessage() {
     createdAt: new Date().toISOString(),
   });
   DB.setNotifs(notifs);
-
-  // Trigger storage event for cross-tab simulation
-  const current = localStorage.getItem('rm_chats');
   localStorage.setItem('rm_chats_ping', Date.now().toString());
 }
 
@@ -344,7 +371,6 @@ function renderChatMessages() {
   const room = DB.getChatRoom(chatState.roomId);
   const msgs = room.messages || [];
 
-  // Mark messages as read
   let updated = false;
   msgs.forEach(m => {
     if (m.senderId !== state.user?.id && !m.read) {
@@ -355,32 +381,31 @@ function renderChatMessages() {
   if (updated) {
     room.messages = msgs;
     DB.setChatRoom(chatState.roomId, room);
-    checkUnreadChats();
+    checkUnreadBadges();
   }
 
   const container = document.getElementById('chat-messages');
   if (!container) return;
 
-  container.innerHTML = msgs.length === 0 ? `<div style="color:var(--text3);text-align:center;margin-top:32px;font-size:13px">Nenhuma mensagem ainda.<br>Diga olá! 👋</div>` :
-    msgs.map(m => {
-      if (m.senderId === '__system__') {
-        return `<div class="chat-system-msg">${m.text}</div>`;
-      }
-      const isSent = m.senderId === state.user?.id;
-      return `<div class="chat-msg ${isSent ? 'sent' : 'received'}">
-        ${m.text}
-        <span class="chat-msg-time">${chatTime(m.time)}${isSent ? ' ✓' : ''}</span>
-      </div>`;
-    }).join('');
+  container.innerHTML = msgs.length === 0
+    ? `<div style="color:var(--text3);text-align:center;margin-top:32px;font-size:13px">Nenhuma mensagem ainda.<br>Diga olá! 👋</div>`
+    : msgs.map(m => {
+        if (m.senderId === '__system__') {
+          return `<div class="chat-system-msg">${m.text}</div>`;
+        }
+        const isSent = m.senderId === state.user?.id;
+        return `<div class="chat-msg ${isSent ? 'sent' : 'received'}">
+          ${m.text}
+          <span class="chat-msg-time">${chatTime(m.time)}</span>
+        </div>`;
+      }).join('');
 
-  // Scroll to bottom
-  container.scrollTop = container.scrollHeight;
   chatState.lastMsgCount = msgs.length;
+  container.scrollTop = container.scrollHeight;
 }
 
 function startChatPoll() {
-  // Poll every 1.5 seconds for new messages (simulates WebSocket)
-  setInterval(() => {
+  chatState.pollInterval = setInterval(() => {
     if (chatState.open && chatState.roomId) {
       const room = DB.getChatRoom(chatState.roomId);
       const count = room.messages?.length || 0;
@@ -388,38 +413,8 @@ function startChatPoll() {
         renderChatMessages();
       }
     }
-    if (state.user) checkUnreadChats();
+    if (state.user) checkUnreadBadges();
   }, 1500);
-}
-
-// ─── NAV RENDER ──────────────────────────────────────────────
-function renderNav() {
-  const u = state.user;
-  const notifs = u ? DB.getNotifs().filter(n => n.userId === u.id && !n.read).length : 0;
-  const cartCount = u ? DB.getCart().filter(c => c.userId === u.id).length : 0;
-  const el = document.getElementById('nav-actions');
-
-  if (!u) {
-    el.innerHTML = `
-      <button class="nav-btn" onclick="showLogin()">Entrar</button>
-      <button class="nav-btn primary" onclick="showRegister()">Cadastrar</button>
-    `;
-  } else {
-    el.innerHTML = `
-      ${u.isSeller ? `<button class="nav-btn" onclick="navigate('seller-dashboard')">Vender</button>` : ''}
-      <button class="nav-icon-btn" onclick="navigate('my-chats')" title="Chat">💬
-        ${getUnreadChatCount() > 0 ? `<span class="badge">${getUnreadChatCount()}</span>` : ''}
-      </button>
-      <button class="nav-icon-btn" onclick="navigate('cart')" title="Carrinho">🛒
-        ${cartCount > 0 ? `<span class="badge">${cartCount}</span>` : ''}
-      </button>
-      <button class="nav-icon-btn" onclick="navigate('notifications')" title="Notificações">🔔
-        ${notifs > 0 ? `<span class="badge">${notifs}</span>` : ''}
-      </button>
-      <img class="avatar-nav" src="${u.avatar}" alt="${u.username}" onclick="navigate('profile')" onerror="this.src='https://api.dicebear.com/7.x/initials/svg?seed=${u.username}'">
-    `;
-  }
-  updateBottomNav();
 }
 
 function getUnreadChatCount() {
@@ -433,6 +428,62 @@ function getUnreadChatCount() {
     });
   });
   return unread;
+}
+
+// ─── NAV RENDER ──────────────────────────────────────────────
+function renderNav() {
+  const u = state.user;
+  const notifs = u ? DB.getNotifs().filter(n => n.userId === u.id && !n.read).length : 0;
+  const cartCount = u ? DB.getCart().filter(c => c.userId === u.id).length : 0;
+  const chatUnread = getUnreadChatCount();
+
+  const bubble = document.getElementById('user-bubble');
+  const dropdown = document.getElementById('user-dropdown');
+  if (!bubble || !dropdown) return;
+
+  if (!u) {
+    bubble.innerHTML = `<span style="font-size:18px;line-height:1">👤</span>`;
+    dropdown.innerHTML = `
+      <div class="dropdown-item" onclick="closeUserMenu();showLogin()">🔑 Entrar</div>
+      <div class="dropdown-item" onclick="closeUserMenu();showRegister()">✨ Criar conta</div>
+    `;
+  } else {
+    bubble.innerHTML = `<img src="${u.avatar}" alt="${u.username}" onerror="this.src='https://api.dicebear.com/7.x/initials/svg?seed=${u.username}'">`;
+    dropdown.innerHTML = `
+      <div class="dropdown-header">
+        <img src="${u.avatar}" style="width:36px;height:36px;border-radius:50%;object-fit:cover;border:2px solid var(--border2);flex-shrink:0" onerror="this.src='https://api.dicebear.com/7.x/initials/svg?seed=${u.username}'">
+        <div>
+          <div style="font-size:13px;font-weight:600;color:var(--text)">${u.username}</div>
+          <div style="font-size:10px;color:${u.isAdmin ? 'var(--success)' : u.isSeller ? 'var(--success)' : 'var(--text3)'}">${u.isAdmin ? '⭐ Admin' : u.isSeller ? '✓ Vendedor' : 'Comprador'}</div>
+        </div>
+      </div>
+      <div class="dropdown-divider"></div>
+      <div class="dropdown-item" onclick="closeUserMenu();navigate('profile')">👤 Meu Perfil</div>
+      <div class="dropdown-item" onclick="closeUserMenu();navigate('cart')">
+        🛒 Carrinho
+        ${cartCount > 0 ? `<span class="dropdown-badge">${cartCount}</span>` : ''}
+      </div>
+      <div class="dropdown-item" onclick="closeUserMenu();navigate('notifications')">
+        🔔 Notificações
+        ${notifs > 0 ? `<span class="dropdown-badge">${notifs}</span>` : ''}
+      </div>
+      <div class="dropdown-item" onclick="closeUserMenu();navigate('my-chats')">
+        💬 Mensagens
+        <span class="dropdown-badge" id="dd-chat-badge" style="display:${chatUnread > 0 ? 'inline-flex' : 'none'}">${chatUnread}</span>
+      </div>
+      <div class="dropdown-item" onclick="closeUserMenu();navigate('favorites')">❤ Favoritos</div>
+      <div class="dropdown-item" onclick="closeUserMenu();navigate('orders')">📦 Meus Pedidos</div>
+      ${u.isSeller ? `
+        <div class="dropdown-divider"></div>
+        <div class="dropdown-item" onclick="closeUserMenu();navigate('seller-dashboard')">🏪 Painel do Vendedor</div>
+      ` : ''}
+      ${u.isAdmin ? `
+        <div class="dropdown-item" onclick="closeUserMenu();navigate('admin-users')">⚙ Gerenciar Usuários</div>
+      ` : ''}
+      <div class="dropdown-divider"></div>
+      <div class="dropdown-item danger" onclick="closeUserMenu();doLogout()">🚪 Sair</div>
+    `;
+  }
 }
 
 // ─── MAIN RENDER ─────────────────────────────────────────────
@@ -454,6 +505,7 @@ function render() {
     'add-product': renderAddProduct,
     'edit-product': renderEditProduct,
     'seller-coupons': renderSellerCoupons,
+    'seller-pix': renderSellerPix,
     notifications: renderNotifications,
     'admin-users': renderAdminUsers,
     orders: renderOrders,
@@ -693,7 +745,7 @@ function renderMyChats() {
     const unread = msgs.filter(m => m.senderId !== state.user.id && m.senderId !== '__system__' && !m.read).length;
 
     return `
-      <div class="chat-conv-item" onclick="openChatFromList('${otherId}')">
+      <div class="chat-conv-item" onclick="openChat('${otherId}')">
         <img class="chat-conv-avatar" src="${other.avatar || ''}" alt="${other.username}" onerror="this.src='https://api.dicebear.com/7.x/initials/svg?seed=${other.username}'">
         <div class="chat-conv-info">
           <div class="chat-conv-name">${other.username} ${other.isSeller ? '<span style="font-size:10px;color:var(--success)">✓</span>' : ''}</div>
@@ -715,10 +767,6 @@ function renderMyChats() {
       </div>
     </div>
   `;
-}
-
-function openChatFromList(otherUserId) {
-  openChat(otherUserId);
 }
 
 // ─── AUTH ─────────────────────────────────────────────────────
@@ -800,6 +848,7 @@ function doRegister() {
     id: uid(), username, email, phone, password,
     avatar: `https://api.dicebear.com/7.x/initials/svg?seed=${username}&backgroundColor=111111&textColor=ffffff`,
     isSeller: false, isAdmin: false, createdAt: new Date().toISOString(), bio: '',
+    pixKey: '', pixKeyType: 'email',
   };
   users.push(newUser);
   DB.setUsers(users);
@@ -866,6 +915,39 @@ function renderProfile() {
           <div class="form-group"><label>E-mail</label><input class="form-control" id="edit-email" value="${u.email || ''}" type="email"></div>
           <div class="form-group"><label>Telefone</label><input class="form-control" id="edit-phone" value="${u.phone || ''}" type="tel"></div>
           <button class="btn btn-primary" onclick="saveProfile()">Salvar alterações</button>
+
+          ${u.isSeller ? `
+          <div class="divider"></div>
+          <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin-bottom:14px">MINHA CHAVE PIX</h3>
+          <div class="pix-setup-card">
+            <div class="form-group">
+              <label>Tipo de chave PIX</label>
+              <select class="form-control" id="pix-type">
+                <option value="email" ${u.pixKeyType === 'email' ? 'selected' : ''}>E-mail</option>
+                <option value="cpf" ${u.pixKeyType === 'cpf' ? 'selected' : ''}>CPF</option>
+                <option value="cnpj" ${u.pixKeyType === 'cnpj' ? 'selected' : ''}>CNPJ</option>
+                <option value="telefone" ${u.pixKeyType === 'telefone' ? 'selected' : ''}>Telefone</option>
+                <option value="aleatoria" ${u.pixKeyType === 'aleatoria' ? 'selected' : ''}>Chave Aleatória</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Chave PIX *</label>
+              <input class="form-control" id="pix-key" value="${u.pixKey || ''}" placeholder="Ex: seu@email.com, 000.000.000-00...">
+            </div>
+            ${u.pixKey ? `
+              <div style="background:rgba(68,255,136,0.07);border:1px solid rgba(68,255,136,0.2);border-radius:var(--radius);padding:12px;margin-bottom:14px;font-size:12px">
+                <div style="color:var(--success);font-weight:600;margin-bottom:4px">✓ Chave PIX cadastrada</div>
+                <div style="color:var(--text2);font-family:'Space Mono',monospace">${u.pixKey}</div>
+                <div style="color:var(--text3);margin-top:2px">Tipo: ${u.pixKeyType}</div>
+              </div>
+            ` : `
+              <div style="background:rgba(255,204,0,0.07);border:1px solid rgba(255,204,0,0.2);border-radius:var(--radius);padding:12px;margin-bottom:14px;font-size:12px;color:var(--warning)">
+                ⚠ Nenhuma chave PIX cadastrada. Seus clientes não poderão pagar via PIX.
+              </div>
+            `}
+            <button class="btn btn-primary" onclick="savePixKey()">💾 Salvar chave PIX</button>
+          </div>
+          ` : ''}
         </div>
       </div>
       <div id="tab-orders" style="display:none">
@@ -954,6 +1036,77 @@ function saveProfile() {
     DB.setCurrent(state.user);
     toast('Perfil salvo!', 'success');
   }
+}
+
+// ─── SELLER PIX ──────────────────────────────────────────────
+function savePixKey() {
+  const pixKey = document.getElementById('pix-key')?.value?.trim();
+  const pixKeyType = document.getElementById('pix-type')?.value;
+  if (!pixKey) { toast('Informe a chave PIX', 'error'); return; }
+
+  const users = DB.getUsers();
+  const idx = users.findIndex(u => u.id === state.user.id);
+  if (idx >= 0) {
+    users[idx].pixKey = pixKey;
+    users[idx].pixKeyType = pixKeyType;
+    DB.setUsers(users);
+    state.user = users[idx];
+    DB.setCurrent(state.user);
+    toast('Chave PIX salva!', 'success');
+    render();
+  }
+}
+
+function renderSellerPix() {
+  if (!state.user?.isSeller) { navigate('home'); return ''; }
+  const u = state.user;
+  return `
+    <div class="page-container" style="padding-top:24px;max-width:560px;margin:0 auto">
+      <button class="btn btn-outline btn-sm" style="margin-bottom:20px" onclick="history.back()">← Voltar</button>
+      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:6px">CHAVE PIX</h2>
+      <p style="color:var(--text3);margin-bottom:24px;font-size:13px">Configure sua chave PIX para receber pagamentos</p>
+
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius2);padding:24px">
+        <div class="form-group">
+          <label>Tipo de Chave *</label>
+          <select class="form-control" id="pix-type">
+            <option value="email" ${u.pixKeyType === 'email' ? 'selected' : ''}>📧 E-mail</option>
+            <option value="cpf" ${u.pixKeyType === 'cpf' ? 'selected' : ''}>🪪 CPF</option>
+            <option value="cnpj" ${u.pixKeyType === 'cnpj' ? 'selected' : ''}>🏢 CNPJ</option>
+            <option value="telefone" ${u.pixKeyType === 'telefone' ? 'selected' : ''}>📱 Telefone</option>
+            <option value="aleatoria" ${u.pixKeyType === 'aleatoria' ? 'selected' : ''}>🔀 Chave Aleatória</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Chave PIX *</label>
+          <input class="form-control" id="pix-key" value="${u.pixKey || ''}" placeholder="Ex: seu@email.com, 000.000.000-00...">
+        </div>
+
+        ${u.pixKey ? `
+          <div style="background:rgba(68,255,136,0.07);border:1px solid rgba(68,255,136,0.2);border-radius:var(--radius);padding:14px;margin-bottom:16px">
+            <div style="font-size:11px;font-weight:600;color:var(--success);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">✓ Chave PIX Cadastrada</div>
+            <div style="font-family:'Space Mono',monospace;font-size:13px;word-break:break-all">${u.pixKey}</div>
+            <div style="font-size:11px;color:var(--text3);margin-top:4px">Tipo: ${u.pixKeyType}</div>
+          </div>
+        ` : `
+          <div style="background:rgba(255,204,0,0.07);border:1px solid rgba(255,204,0,0.2);border-radius:var(--radius);padding:14px;margin-bottom:16px">
+            <div style="font-size:12px;color:var(--warning)">⚠ Nenhuma chave PIX cadastrada. Configure agora para receber pagamentos dos seus clientes.</div>
+          </div>
+        `}
+
+        <button class="btn btn-primary btn-full" onclick="savePixKey()">💾 Salvar Chave PIX</button>
+      </div>
+
+      <div style="margin-top:16px;padding:16px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius2)">
+        <h3 style="font-family:'Bebas Neue',sans-serif;font-size:16px;letter-spacing:2px;margin-bottom:10px;color:var(--text2)">COMO FUNCIONA</h3>
+        <div style="font-size:12px;color:var(--text3);line-height:1.8">
+          <p>• Quando um cliente finalizar uma compra, sua chave PIX será exibida para pagamento</p>
+          <p>• O QR Code será gerado automaticamente com sua chave</p>
+          <p>• Mantenha sua chave atualizada para não perder vendas</p>
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 // ─── SELLER PROFILE (public) ──────────────────────────────────
@@ -1050,6 +1203,7 @@ function renderCart() {
 }
 
 function renderCartContent() {
+  if (!state.user) return '';
   const cartItems = DB.getCart().filter(c => c.userId === state.user.id);
   if (cartItems.length === 0) return `<div class="empty-state" style="padding:40px"><div class="icon">🛒</div><h3>Carrinho vazio</h3></div>`;
   return cartItems.map(item => {
@@ -1069,6 +1223,7 @@ function renderCartContent() {
 }
 
 function renderFavsContent() {
+  if (!state.user) return '';
   const favs = DB.getFavs().filter(f => f.userId === state.user.id);
   if (favs.length === 0) return `<div class="empty-state" style="padding:40px"><div class="icon">❤</div><h3>Nenhum favorito</h3></div>`;
   const favProds = favs.map(f => DB.getProducts().find(p => p.id === f.productId)).filter(Boolean);
@@ -1146,7 +1301,7 @@ function renderCheckout() {
   if (!state.user) { showLogin(); return ''; }
   const isCart = state.params.id === 'cart';
   const cartItems = isCart ? JSON.parse(sessionStorage.getItem('checkout_cart') || '[]') : null;
-  const buyNow = !isCart ? JSON.parse(sessionStorage.getItem('buy_now') || 'null') : null;
+  const buyNowData = !isCart ? JSON.parse(sessionStorage.getItem('buy_now') || 'null') : null;
 
   let items = [];
   let total = 0;
@@ -1161,12 +1316,19 @@ function renderCheckout() {
       total += sub;
       return { product: p, quantity: c.quantity, subtotal: sub };
     }).filter(Boolean);
-  } else if (buyNow) {
-    const p = products.find(pr => pr.id === buyNow.productId);
-    if (p) { const sub = p.price * buyNow.quantity; total += sub; items = [{ product: p, quantity: buyNow.quantity, subtotal: sub }]; }
+  } else if (buyNowData) {
+    const p = products.find(pr => pr.id === buyNowData.productId);
+    if (p) { const sub = p.price * buyNowData.quantity; total += sub; items = [{ product: p, quantity: buyNowData.quantity, subtotal: sub }]; }
   }
 
-  let discountedTotal = coupon ? total * (1 - coupon.discount / 100) : total;
+  const discountedTotal = coupon ? total * (1 - coupon.discount / 100) : total;
+
+  // ⚡ FIX: Store order data globally to avoid JSON serialization in onclick attribute
+  _pendingOrderData = {
+    total: discountedTotal,
+    originalTotal: total,
+    items: items.map(i => ({ id: i.product.id, qty: i.quantity, price: i.product.price })),
+  };
 
   return `
     <div class="page-container" style="padding-top:24px">
@@ -1206,7 +1368,7 @@ function renderCheckout() {
             `).join('')}
             ${coupon ? `<div class="summary-row" style="color:var(--success)"><span>Cupom (${coupon.discount}%)</span><span>-${fmt(total - discountedTotal)}</span></div>` : ''}
             <div class="summary-row total"><span>Total</span><span>${fmt(discountedTotal)}</span></div>
-            <button class="btn btn-primary btn-full" style="margin-top:16px" onclick="placeOrder(${discountedTotal}, ${total}, ${JSON.stringify(items.map(i => ({id: i.product.id, qty: i.quantity, price: i.product.price})))})">
+            <button class="btn btn-primary btn-full" style="margin-top:16px" onclick="placeOrder()">
               Confirmar e Pagar →
             </button>
           </div>
@@ -1230,8 +1392,13 @@ async function fetchCEP(cep) {
   } catch {}
 }
 
-function placeOrder(total, originalTotal, itemsData) {
+// ⚡ FIX: placeOrder reads from global _pendingOrderData instead of inline params
+function placeOrder() {
   if (!state.user) return;
+  if (!_pendingOrderData) { toast('Erro ao processar pedido. Tente novamente.', 'error'); return; }
+
+  const { total, originalTotal, items: itemsData } = _pendingOrderData;
+
   const name = document.getElementById('co-name')?.value?.trim();
   const email = document.getElementById('co-email')?.value?.trim();
   const phone = document.getElementById('co-phone')?.value?.trim();
@@ -1262,23 +1429,30 @@ function placeOrder(total, originalTotal, itemsData) {
   });
 
   Object.entries(bySeller).forEach(([sellerId, sellerItems]) => {
+    const seller = DB.getUsers().find(u => u.id === sellerId);
     const orderTotal = sellerItems.reduce((a, i) => a + i.price * i.qty, 0) * (coupon && coupon.sellerId === sellerId ? (1 - coupon.discount / 100) : 1);
+    const pixKey = seller?.pixKey || `${sellerId}@redzinmarket.com`;
     const order = {
       id: uid(), buyerId: state.user.id, sellerId, productId: sellerItems[0].productId,
       quantity: sellerItems[0].qty, items: sellerItems, address,
       total: parseFloat(orderTotal.toFixed(2)),
       coupon: coupon && coupon.sellerId === sellerId ? coupon : null,
+      pixKey,
       status: 'pending_payment',
-      tracking: [{ status: 'Pedido criado', date: new Date().toISOString(), location: 'Sistema' }],
-      pixKey: generatePixKey(), createdAt: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+      tracking: [{ status: 'Pedido realizado', date: new Date().toISOString(), location: 'REDZIN MARKET' }],
     };
-    orders.push(order);
     if (!firstOrderId) firstOrderId = order.id;
-    if (coupon && coupon.sellerId === sellerId) {
-      const coupons = DB.getCoupons();
-      const idx = coupons.findIndex(c => c.id === coupon.couponId);
-      if (idx >= 0) { coupons[idx].uses++; DB.setCoupons(coupons); }
-    }
+    orders.push(order);
+
+    const notifs = DB.getNotifs();
+    const p = products.find(pr => pr.id === sellerItems[0].productId);
+    notifs.push({
+      id: uid(), userId: sellerId, type: 'order',
+      message: `🛍 Novo pedido de ${state.user.username}: ${p?.title || 'Produto'} — ${fmt(orderTotal)}`,
+      orderId: order.id, read: false, createdAt: new Date().toISOString(),
+    });
+    DB.setNotifs(notifs);
   });
 
   DB.setOrders(orders);
@@ -1286,11 +1460,14 @@ function placeOrder(total, originalTotal, itemsData) {
   sessionStorage.removeItem('buy_now');
   sessionStorage.removeItem('checkout_cart');
   DB.setCart(DB.getCart().filter(c => c.userId !== state.user.id || !itemsData.find(i => i.id === c.productId)));
+
+  _pendingOrderData = null;
   navigate('payment', { id: firstOrderId });
 }
 
-function generatePixKey() {
-  return `redzin.market@pix.${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+function getSellerPixKey(sellerId) {
+  const seller = DB.getUsers().find(u => u.id === sellerId);
+  return seller?.pixKey || `${sellerId}@redzinmarket.com`;
 }
 
 // ─── PAYMENT PAGE ──────────────────────────────────────────────
@@ -1320,7 +1497,7 @@ function renderPayment() {
           <div class="payment-status pending" id="payment-status">⏳ Aguardando confirmação...</div>
           <div class="countdown" id="payment-countdown">10:00</div>
           <div class="progress-bar"><div class="progress-fill" id="payment-progress" style="width:100%"></div></div>
-          <p style="font-size:11px;color:var(--text3);margin-bottom:14px">Após pagar, a confirmação é automática</p>
+          <p style="font-size:11px;color:var(--text3);margin-bottom:14px">Após pagar, confirme abaixo</p>
           <button class="btn btn-success btn-full" onclick="simulatePayment('${order.id}')">✓ Já realizei o pagamento</button>
           <button class="btn btn-outline btn-full" style="margin-top:8px" onclick="navigate('tracking',{id:'${order.id}'})">Rastrear pedido</button>
         `}
@@ -1558,14 +1735,25 @@ function renderSellerDashboard() {
   const products = DB.getProducts().filter(p => p.sellerId === state.user.id);
   const totalRevenue = orders.filter(o => o.status !== 'pending_payment').reduce((a, o) => a + o.total, 0);
   const notifs = DB.getNotifs().filter(n => n.userId === state.user.id && !n.read).length;
-
-  // Count unread chats
   const chatUnread = getUnreadChatCount();
+  const u = state.user;
+  const hasPixKey = !!(u.pixKey);
 
   return `
     <div class="page-container" style="padding-top:24px">
       <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:6px">PAINEL DO VENDEDOR</h2>
       <p style="color:var(--text3);margin-bottom:24px">Olá, ${state.user.username}!</p>
+
+      ${!hasPixKey ? `
+      <div style="background:rgba(255,204,0,0.07);border:1px solid rgba(255,204,0,0.3);border-radius:var(--radius2);padding:16px;margin-bottom:20px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <span style="font-size:24px">⚠️</span>
+        <div style="flex:1">
+          <div style="font-size:13px;font-weight:600;color:var(--warning)">Chave PIX não cadastrada</div>
+          <div style="font-size:12px;color:var(--text3)">Configure sua chave PIX para receber pagamentos dos clientes.</div>
+        </div>
+        <button class="btn btn-outline btn-sm" style="border-color:var(--warning);color:var(--warning)" onclick="navigate('seller-pix')">Configurar PIX →</button>
+      </div>
+      ` : ''}
 
       <div class="dash-grid">
         <div class="dash-card">
@@ -1588,8 +1776,9 @@ function renderSellerDashboard() {
 
       <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;margin-bottom:28px" class="dash-btns-grid">
         <button class="btn btn-primary" onclick="navigate('add-product')">+ Anunciar</button>
-        <button class="btn btn-outline" onclick="navigate('seller-products')">Meus produtos</button>
+        <button class="btn btn-outline" onclick="navigate('seller-products')">Meus Produtos</button>
         <button class="btn btn-outline" onclick="navigate('seller-coupons')">Cupons</button>
+        <button class="btn btn-outline" onclick="navigate('seller-pix')">💳 Chave PIX ${hasPixKey ? '✓' : '⚠'}</button>
         <button class="btn btn-outline" onclick="navigate('my-chats')">💬 Chats ${chatUnread > 0 ? `(${chatUnread})` : ''}</button>
         <button class="btn btn-outline" onclick="navigate('notifications')">🔔 ${notifs > 0 ? `(${notifs})` : 'Notifs'}</button>
       </div>
