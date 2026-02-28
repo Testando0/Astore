@@ -2,10 +2,25 @@
 // REDZIN MARKET — Full E-Commerce App
 // ============================================================
 
-// ─── DATABASE (localStorage) ─────────────────────────────────
+// ─── IN-MEMORY STORE (fallback when localStorage is blocked) ──
+const _mem = {};
+function lsGet(k, def) {
+  try {
+    const v = localStorage.getItem(k);
+    if (v !== null) { _mem[k] = v; return JSON.parse(v) ?? def; }
+  } catch(e) {}
+  try { return _mem[k] !== undefined ? JSON.parse(_mem[k]) : def; } catch(e) { return def; }
+}
+function lsSet(k, v) {
+  const s = JSON.stringify(v);
+  _mem[k] = s;
+  try { localStorage.setItem(k, s); } catch(e) {}
+}
+
+// ─── DATABASE ────────────────────────────────────────────────
 const DB = {
-  get: (k, def = []) => { try { return JSON.parse(localStorage.getItem(k)) ?? def; } catch { return def; } },
-  set: (k, v) => localStorage.setItem(k, JSON.stringify(v)),
+  get: (k, def = []) => lsGet(k, def),
+  set: (k, v) => lsSet(k, v),
   getUsers: () => DB.get('rm_users', []),
   setUsers: v => DB.set('rm_users', v),
   getProducts: () => DB.get('rm_products', []),
@@ -32,6 +47,8 @@ const DB = {
     const chats = DB.getChats();
     chats[roomId] = room;
     DB.setChats(chats);
+    // Trigger in-page chat update for other "users" in same session
+    window.dispatchEvent(new CustomEvent('rm_chats_updated', { detail: { roomId } }));
   },
 };
 
@@ -86,12 +103,20 @@ function init() {
 
   startChatPoll();
 
-  window.addEventListener('storage', (e) => {
-    if (e.key === 'rm_chats' && chatState.open && chatState.roomId) {
+  // Listen to in-page chat updates (works even when localStorage is blocked)
+  window.addEventListener('rm_chats_updated', () => {
+    if (chatState.open && chatState.roomId) {
       renderChatMessages();
-      checkUnreadBadges();
     }
-    if (e.key === 'rm_chats') checkUnreadBadges();
+    if (state.user) checkUnreadBadges();
+  });
+  // Also listen to cross-tab storage events as fallback
+  window.addEventListener('storage', (e) => {
+    if (e.key === 'rm_chats') {
+      try { if (e.newValue) _mem['rm_chats'] = e.newValue; } catch(ex) {}
+      if (chatState.open && chatState.roomId) renderChatMessages();
+      if (state.user) checkUnreadBadges();
+    }
   });
 
   // Close dropdown on outside click
@@ -351,6 +376,7 @@ function sendChatMessage() {
   input.value = '';
   renderChatMessages();
 
+  // Notify the other user
   const notifs = DB.getNotifs();
   notifs.push({
     id: uid(),
@@ -363,7 +389,6 @@ function sendChatMessage() {
     createdAt: new Date().toISOString(),
   });
   DB.setNotifs(notifs);
-  localStorage.setItem('rm_chats_ping', Date.now().toString());
 }
 
 function renderChatMessages() {
