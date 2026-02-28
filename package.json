@@ -1,0 +1,12 @@
+{
+  "name": "shopee-bw",
+  "version": "1.0.0",
+  "description": "Black & White E-commerce Platform",
+  "scripts": {
+    "start": "npx serve .",
+    "dev": "npx serve ."
+  },
+  "devDependencies": {
+    "serve": "^14.2.0"
+  }
+}

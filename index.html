@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>REDZIN MARKET — Black & White Store</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+</head>
+<body>
+
+<!-- NAVBAR -->
+<nav id="navbar">
+  <div class="nav-logo" onclick="navigate('home')">REDZIN<span>MARKET</span></div>
+  <div class="nav-search">
+    <input type="text" id="search-input" placeholder="Buscar produtos..." onkeydown="if(event.key==='Enter') searchProducts()">
+    <button class="nav-search-btn" onclick="searchProducts()">Buscar</button>
+  </div>
+  <div class="nav-actions" id="nav-actions"></div>
+</nav>
+
+<!-- MAIN -->
+<div id="main"></div>
+
+<!-- TOAST CONTAINER -->
+<div id="toast-container"></div>
+
+<!-- MODALS -->
+<div id="modal-container"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
