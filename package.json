@@ -1,12 +1,13 @@
 {
-  "name": "shopee-bw",
-  "version": "1.0.0",
-  "description": "Black & White E-commerce Platform",
+  "name": "redzin-market",
+  "version": "2.0.0",
+  "description": "REDZIN MARKET — Black & White E-commerce Platform with WebSocket Chat",
+  "main": "server.js",
   "scripts": {
-    "start": "npx serve .",
-    "dev": "npx serve ."
+    "start": "node server.js",
+    "dev": "node server.js"
   },
-  "devDependencies": {
-    "serve": "^14.2.0"
+  "dependencies": {
+    "ws": "^8.17.0"
   }
 }
