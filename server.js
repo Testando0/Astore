@@ -165,8 +165,15 @@ wss.on('connection', (ws) => {
         serverData.chats[roomId].messages.push(message);
         saveData(serverData);
 
-        // Send to all participants
-        sendToRoom(roomId, { type: 'new_message', roomId, message });
+        // Send to other participants only (sender has optimistic copy already)
+        const roomForMsg = serverData.chats[roomId];
+        roomForMsg.participants.forEach(pUid => {
+          if (pUid !== senderId) {
+            sendTo(pUid, { type: 'new_message', roomId, message });
+          }
+        });
+        // Confirm to sender: replace optimistic with server version
+        sendTo(senderId, { type: 'message_sent', roomId, message });
         break;
       }
 
@@ -210,9 +217,14 @@ wss.on('connection', (ws) => {
         if (idx >= 0) {
           serverData.users[idx].isSeller = promote;
           saveData(serverData);
-          // Notify target user if online
-          sendTo(targetUserId, { type: 'user_update', user: serverData.users[idx] });
-          ws.send(JSON.stringify({ type: 'promote_ack', userId: targetUserId, isSeller: promote }));
+          const updatedUser = serverData.users[idx];
+          // Notify target user if online (they get user_update with new isSeller)
+          sendTo(targetUserId, { type: 'user_update', user: updatedUser });
+          // Send ack to admin with the updated user object (so UI can update directly)
+          ws.send(JSON.stringify({ type: 'promote_ack', userId: targetUserId, isSeller: promote, user: updatedUser }));
+        } else {
+          // User not on server yet — still ack so admin UI updates
+          ws.send(JSON.stringify({ type: 'promote_ack', userId: targetUserId, isSeller: promote, user: null }));
         }
         break;
       }

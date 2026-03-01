@@ -65,28 +65,27 @@ const WS = {
     switch (msg.type) {
 
       case 'user_update': {
-        // Server sends authoritative user data (e.g. after promotion)
         const { user } = msg;
-        // Update in users array
+        // Update in local users array
         const users = DB.getUsers();
         const idx = users.findIndex(u => u.id === user.id);
         if (idx >= 0) {
-          users[idx] = { ...users[idx], ...user };
+          users[idx] = { ...users[idx], isSeller: user.isSeller, isAdmin: user.isAdmin };
           DB.setUsers(users);
         }
-        // Update current session if it's us
+        // Update current session if it's THIS user
         if (state.user && state.user.id === user.id) {
           const wasNotSeller = !state.user.isSeller;
-          state.user = { ...state.user, ...user };
+          state.user = { ...state.user, isSeller: user.isSeller, isAdmin: user.isAdmin };
           DB.setCurrent(state.user);
           if (wasNotSeller && user.isSeller) {
+            // Add local notification
+            const notifs = DB.getNotifs();
+            notifs.push({ id: uid(), userId: user.id, type: 'promotion', message: '🎉 Parabéns! Você foi promovido a vendedor no REDZIN MARKET!', read: false, createdAt: new Date().toISOString() });
+            DB.setNotifs(notifs);
             toast('🎉 Você foi promovido a Vendedor!', 'success');
           }
           renderNav();
-          // Re-render if on a seller-restricted page
-          if (['seller-dashboard','seller-products','add-product','edit-product','seller-coupons','seller-pix'].includes(state.route)) {
-            render();
-          }
         }
         break;
       }
@@ -111,26 +110,39 @@ const WS = {
       }
 
       case 'new_message': {
-        // Real-time message delivery via WebSocket
+        // Real-time message delivery via WebSocket (for recipients, NOT sender)
         const { roomId, message } = msg;
         const chats = DB.getChats();
         if (!chats[roomId]) chats[roomId] = { participants: [], messages: [] };
-        chats[roomId].messages.push(message);
+        // Avoid duplicate: don't add if already exists with same id
+        const already = chats[roomId].messages.find(m => m.id === message.id);
+        if (!already) chats[roomId].messages.push(message);
         DB.setChats(chats);
 
         if (chatState.open && chatState.roomId === roomId) {
-          // Mark as read immediately since chat is open
           WS.send({ type: 'chat_read', roomId, userId: state.user?.id });
           renderChatMessages();
         } else {
-          // Show badge
           checkUnreadBadges();
-          // Show toast notification
           if (state.user && message.senderId !== state.user.id) {
             const sender = DB.getUsers().find(u => u.id === message.senderId);
             if (sender) toast(`💬 ${sender.username}: ${message.text.slice(0, 50)}`, 'info');
           }
         }
+        break;
+      }
+
+      case 'message_sent': {
+        // Server confirms our sent message — replace optimistic copy with server version
+        const { roomId, message } = msg;
+        const chats = DB.getChats();
+        if (!chats[roomId]) break;
+        // Remove optimistic copy and replace with authoritative server message
+        chats[roomId].messages = chats[roomId].messages.filter(m => !m._optimistic);
+        const already = chats[roomId].messages.find(m => m.id === message.id);
+        if (!already) chats[roomId].messages.push(message);
+        DB.setChats(chats);
+        if (chatState.open && chatState.roomId === roomId) renderChatMessages();
         break;
       }
 
@@ -148,28 +160,48 @@ const WS = {
       }
 
       case 'promote_ack': {
-        const { userId, isSeller } = msg;
-        // Already handled via user_update, just re-render admin panel
-        toast(isSeller ? `Usuário promovido a vendedor!` : `Status de vendedor removido`, 'success');
-        render();
+        const { userId, isSeller, user: updatedUser } = msg;
+        // Update local users list directly
+        const users = DB.getUsers();
+        const idx = users.findIndex(u => u.id === userId);
+        if (idx >= 0) {
+          users[idx].isSeller = isSeller;
+          if (updatedUser) users[idx] = { ...users[idx], ...updatedUser };
+          DB.setUsers(users);
+        }
+        // If promoted user is currently logged in on this tab, update session
+        if (state.user && state.user.id === userId) {
+          state.user = { ...state.user, isSeller };
+          DB.setCurrent(state.user);
+        }
+        toast(isSeller ? 'Usuário promovido a vendedor!' : 'Status de vendedor removido', 'success');
+        // Re-render admin panel WITHOUT calling get_users (would loop)
+        // Just update the DOM directly
+        const mainEl = document.getElementById('main');
+        if (mainEl && state.route === 'admin-users') {
+          mainEl.innerHTML = renderAdminUsersHTML();
+        }
+        renderNav();
         break;
       }
 
       case 'users_list': {
-        // Server sends fresh user list for admin panel
+        // Server sends fresh user list — update local store WITHOUT calling render()
         const { users } = msg;
-        // Merge server users with local, preserving passwords
         const localUsers = DB.getUsers();
         const merged = users.map(su => {
           const lu = localUsers.find(u => u.id === su.id);
           return lu ? { ...lu, isSeller: su.isSeller, isAdmin: su.isAdmin } : su;
         });
-        // Add local-only users (registered offline)
         localUsers.forEach(lu => {
           if (!merged.find(u => u.id === lu.id)) merged.push(lu);
         });
         DB.setUsers(merged);
-        render();
+        // Re-render admin panel directly if on that page
+        const mainEl = document.getElementById('main');
+        if (mainEl && state.route === 'admin-users') {
+          mainEl.innerHTML = renderAdminUsersHTML();
+        }
         break;
       }
     }
@@ -528,10 +560,8 @@ function openChat(otherUserId, productContext = null) {
   chatState.otherUserId = otherUserId;
 
   let room = DB.getChatRoom(roomId);
-  if (!room.participants || room.participants.length === 0) {
-    // Ask server to create room (real-time)
-    WS.send({ type: 'chat_open', userId: state.user.id, otherUserId, productContext });
-  }
+  // Always request room from server — gets latest messages and creates if new
+  WS.send({ type: 'chat_open', userId: state.user.id, otherUserId, productContext });
 
   document.getElementById('chat-panel-avatar').src = otherUser.avatar || '';
   document.getElementById('chat-panel-name').textContent = otherUser.username;
@@ -578,16 +608,14 @@ function sendChatMessage() {
   const text = input.value.trim();
   if (!text) return;
 
-  // Send via WebSocket — server broadcasts to all participants in real-time
-  WS.send({ type: 'chat_message', roomId: chatState.roomId, senderId: state.user.id, text });
-
   input.value = '';
-  // Optimistically render (server will confirm via new_message)
-  // Already handled by WS._handleMessage('new_message') but we add locally for instant feedback
+
+  // Add optimistic message immediately for instant feedback
   const chats = DB.getChats();
+  const tempId = '_opt_' + uid();
   if (!chats[chatState.roomId]) chats[chatState.roomId] = { participants: [state.user.id, chatState.otherUserId], messages: [] };
   chats[chatState.roomId].messages.push({
-    id: uid(),
+    id: tempId,
     senderId: state.user.id,
     text,
     time: new Date().toISOString(),
@@ -596,6 +624,9 @@ function sendChatMessage() {
   });
   DB.setChats(chats);
   renderChatMessages();
+
+  // Send via WebSocket — server will respond with message_sent (for us) + new_message (for other)
+  WS.send({ type: 'chat_message', roomId: chatState.roomId, senderId: state.user.id, text });
 }
 
 function renderChatMessages() {
@@ -2281,12 +2312,15 @@ function deleteCoupon(id) {
 // ─── ADMIN: USER MANAGEMENT ───────────────────────────────────
 function renderAdminUsers() {
   if (!state.user?.isAdmin) { toast('Acesso restrito', 'error'); navigate('home'); return ''; }
-
-  // Request fresh user list from server (ensures isSeller is authoritative)
+  // Request fresh user list from server — server will respond with users_list
+  // which updates the DOM via renderAdminUsersHTML() without causing a loop
   WS.send({ type: 'get_users' });
+  return renderAdminUsersHTML();
+}
 
+function renderAdminUsersHTML() {
+  if (!state.user?.isAdmin) return '';
   const users = DB.getUsers().filter(u => !u.isAdmin);
-
   return `
     <div class="page-container" style="padding-top:24px">
       <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:6px">USUÁRIOS</h2>
@@ -2314,41 +2348,14 @@ function renderAdminUsers() {
 }
 
 function promoteSeller(userId) {
-  const users = DB.getUsers();
-  const idx = users.findIndex(u => u.id === userId);
-  if (idx < 0) return;
-  users[idx].isSeller = true;
-  DB.setUsers(users);
-  // If this is the currently logged-in user, update their session too
-  if (state.user && state.user.id === userId) {
-    state.user = { ...state.user, isSeller: true };
-    DB.setCurrent(state.user);
-  }
-  const notifs = DB.getNotifs();
-  notifs.push({ id: uid(), userId, type: 'promotion', message: '🎉 Parabéns! Você foi promovido a vendedor no REDZIN MARKET!', read: false, createdAt: new Date().toISOString() });
-  DB.setNotifs(notifs);
-
-  // ✅ Send to server via WebSocket — persists and notifies target user in real-time
+  // Send to server — server persists and responds with promote_ack
+  // promote_ack handler updates local state and UI
   WS.send({ type: 'promote_seller', targetUserId: userId, promote: true });
-  // Don't call toast/render here — handled by promote_ack from server
 }
 
 function demoteSeller(userId) {
   if (!confirm('Remover status de vendedor?')) return;
-  const users = DB.getUsers();
-  const idx = users.findIndex(u => u.id === userId);
-  if (idx < 0) return;
-  users[idx].isSeller = false;
-  DB.setUsers(users);
-  // If this is the currently logged-in user, update their session too
-  if (state.user && state.user.id === userId) {
-    state.user = { ...state.user, isSeller: false };
-    DB.setCurrent(state.user);
-  }
-
-  // ✅ Send to server via WebSocket — persists and notifies target user in real-time
   WS.send({ type: 'promote_seller', targetUserId: userId, promote: false });
-  // Don't call toast/render here — handled by promote_ack from server
 }
 
 // ─── BOOT ────────────────────────────────────────────────────
