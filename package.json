@@ -1,0 +1,13 @@
+{
+  "name": "redzin-market",
+  "version": "2.0.0",
+  "description": "REDZIN MARKET — Black & White E-commerce Platform with WebSocket Chat",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.17.0"
+  }
+}
