@@ -33,27 +33,6 @@
 <!-- MAIN -->
 <div id="main"></div>
 
-<!-- CHAT PANEL -->
-<div class="chat-panel" id="chat-panel">
-  <div class="chat-panel-header">
-    <button class="chat-back-btn" onclick="closeChatPanel()">←</button>
-    <div class="chat-panel-user">
-      <img id="chat-panel-avatar" src="" alt="">
-      <div>
-        <div id="chat-panel-name">Chat</div>
-        <div id="chat-panel-status" class="chat-status">online</div>
-      </div>
-    </div>
-    <button class="chat-close-btn" onclick="closeChatPanel()">×</button>
-  </div>
-  <div class="chat-messages" id="chat-messages"></div>
-  <div class="chat-input-area" id="chat-input-area">
-    <input type="text" id="chat-input" class="chat-input" placeholder="Digite uma mensagem..." onkeydown="if(event.key==='Enter') sendChatMessage()">
-    <button class="chat-send-btn" onclick="sendChatMessage()">➤</button>
-  </div>
-</div>
-<div class="chat-overlay" id="chat-overlay" onclick="closeChatPanel()"></div>
-
 <!-- TOAST CONTAINER -->
 <div id="toast-container"></div>
 

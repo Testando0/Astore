@@ -732,10 +732,6 @@ function renderNav() {
         🔔 Notificações
         ${notifs > 0 ? `<span class="dropdown-badge">${notifs}</span>` : ''}
       </div>
-      <div class="dropdown-item" onclick="closeUserMenu();navigate('my-chats')">
-        💬 Mensagens
-        <span class="dropdown-badge" id="dd-chat-badge" style="display:${chatUnread > 0 ? 'inline-flex' : 'none'}">${chatUnread}</span>
-      </div>
       <div class="dropdown-item" onclick="closeUserMenu();navigate('favorites')">❤ Favoritos</div>
       <div class="dropdown-item" onclick="closeUserMenu();navigate('orders')">📦 Meus Pedidos</div>
       ${u.isSeller ? `
@@ -935,9 +931,10 @@ function renderProduct() {
           </button>
 
           ${!isOwnProduct ? `
-          <button class="chat-seller-btn" onclick="openChat('${seller.id}', '${p.title.replace(/'/g, "\\'")}')">
-            💬 Falar com o vendedor
-          </button>` : ''}
+          <a class="chat-seller-btn" href="https://wa.me/55${(seller.phone||'').replace(/\D/g,'')}" target="_blank" style="display:flex;align-items:center;justify-content:center;gap:8px;text-decoration:none;">
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
+            Falar com o vendedor no WhatsApp
+          </a>` : ''}
 
           <div class="seller-card-mini" onclick="navigate('seller-profile',{id:'${seller.id}'})">
             <img class="seller-avatar-mini" src="${seller.avatar || ''}" alt="${seller.username}" onerror="this.src='https://api.dicebear.com/7.x/initials/svg?seed=${seller.username}'">
@@ -1408,9 +1405,10 @@ function renderSellerProfile() {
             </div>
           </div>
           ${!isOwnProfile ? `
-          <button class="btn btn-outline btn-sm" style="margin-left:auto;align-self:flex-start;gap:6px" onclick="openChat('${seller.id}')">
-            💬 Conversar
-          </button>` : ''}
+          <a class="btn btn-outline btn-sm" style="margin-left:auto;align-self:flex-start;gap:6px;display:flex;align-items:center;text-decoration:none;" href="https://wa.me/55${(seller.phone||'').replace(/\D/g,'')}" target="_blank">
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
+            WhatsApp
+          </a>` : ''}
         </div>
         <div class="profile-tabs">
           <div class="profile-tab active">Produtos</div>
@@ -1886,14 +1884,17 @@ function renderTracking() {
     </div>
   `).join('');
 
+  const sellerUser = DB.getUsers().find(u => u.id === order.sellerId);
   const chatBtn = isSeller && buyer ? `
-    <button class="chat-seller-btn" style="margin-top:16px" onclick="openChat('${buyer.id}')">
-      💬 Falar com o comprador (${buyer.username})
-    </button>
+    <a class="chat-seller-btn" style="margin-top:16px;display:flex;align-items:center;justify-content:center;gap:8px;text-decoration:none;" href="https://wa.me/55${(buyer.phone||'').replace(/\D/g,'')}" target="_blank">
+      <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
+      Falar com o comprador (${buyer.username}) no WhatsApp
+    </a>
   ` : !isSeller ? `
-    <button class="chat-seller-btn" style="margin-top:16px" onclick="openChat('${order.sellerId}')">
-      💬 Falar com o vendedor
-    </button>
+    <a class="chat-seller-btn" style="margin-top:16px;display:flex;align-items:center;justify-content:center;gap:8px;text-decoration:none;" href="https://wa.me/55${(sellerUser?.phone||'').replace(/\D/g,'')}" target="_blank">
+      <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
+      Falar com o vendedor no WhatsApp
+    </a>
   ` : '';
 
   const sellerPanel = isSeller ? `
@@ -2054,7 +2055,6 @@ function renderSellerDashboard() {
         <button class="btn btn-outline" onclick="navigate('seller-products')">Meus Produtos</button>
         <button class="btn btn-outline" onclick="navigate('seller-coupons')">Cupons</button>
         <button class="btn btn-outline" onclick="navigate('seller-pix')">💳 Chave PIX ${hasPixKey ? '✓' : '⚠'}</button>
-        <button class="btn btn-outline" onclick="navigate('my-chats')">💬 Chats ${chatUnread > 0 ? `(${chatUnread})` : ''}</button>
         <button class="btn btn-outline" onclick="navigate('notifications')">🔔 ${notifs > 0 ? `(${notifs})` : 'Notifs'}</button>
       </div>
 
@@ -2324,7 +2324,7 @@ function renderAdminUsersHTML() {
   return `
     <div class="page-container" style="padding-top:24px">
       <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:6px">USUÁRIOS</h2>
-      <p style="color:var(--text3);margin-bottom:20px">Promova usuários a vendedores</p>
+      <p style="color:var(--text3);margin-bottom:20px">Lista de usuários cadastrados</p>
       <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius2);overflow:hidden">
         ${users.length === 0 ? `<div class="empty-state"><div class="icon">👥</div><h3>Nenhum usuário</h3></div>` :
           users.map(u => `
@@ -2335,27 +2335,12 @@ function renderAdminUsersHTML() {
                 <div style="font-size:11px;color:var(--text3)">${u.email || ''}</div>
               </div>
               <span class="role-badge ${u.isSeller ? 'seller' : ''}">${u.isSeller ? 'Vendedor' : 'Comprador'}</span>
-              ${u.isSeller ?
-                `<button class="btn btn-outline btn-sm" style="border-color:var(--danger);color:var(--danger)" onclick="demoteSeller('${u.id}')">Remover</button>` :
-                `<button class="btn btn-outline btn-sm" style="border-color:var(--success);color:var(--success)" onclick="promoteSeller('${u.id}')">Promover</button>`
-              }
             </div>
           `).join('')
         }
       </div>
     </div>
   `;
-}
-
-function promoteSeller(userId) {
-  // Send to server — server persists and responds with promote_ack
-  // promote_ack handler updates local state and UI
-  WS.send({ type: 'promote_seller', targetUserId: userId, promote: true });
-}
-
-function demoteSeller(userId) {
-  if (!confirm('Remover status de vendedor?')) return;
-  WS.send({ type: 'promote_seller', targetUserId: userId, promote: false });
 }
 
 // ─── BOOT ────────────────────────────────────────────────────
