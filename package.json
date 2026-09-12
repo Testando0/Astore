@@ -1,13 +1,12 @@
 {
-  "name": "redzin-market",
-  "version": "2.0.0",
-  "description": "REDZIN MARKET — Black & White E-commerce Platform with WebSocket Chat",
+  "name": "astore",
+  "version": "1.0.0",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "start": "node server.js"
   },
   "dependencies": {
+    "better-sqlite3": "^9.6.0",
     "ws": "^8.17.0"
   }
 }
