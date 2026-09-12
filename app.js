@@ -1,2401 +1,662 @@
-// ============================================================
-// REDZIN MARKET — Full E-Commerce App (WebSocket Edition)
-// ============================================================
+// ========================================
+// REDZIN MARKET - FRONTEND COMPLETO
+// ========================================
+var state = { user: null, page: 'home', params: {}, cart: [] };
+var API = '/api';
+var ws = null;
 
-// ─── WEBSOCKET CLIENT ────────────────────────────────────────
-const WS = {
-  socket: null,
-  reconnectTimer: null,
-  connected: false,
-  queue: [],
-
-  connect() {
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const url = `${proto}://${location.host}`;
-    try {
-      this.socket = new WebSocket(url);
-    } catch (e) {
-      this._scheduleReconnect();
-      return;
-    }
-
-    this.socket.onopen = () => {
-      this.connected = true;
-      clearTimeout(this.reconnectTimer);
-      // Flush queued messages
-      while (this.queue.length) this.socket.send(JSON.stringify(this.queue.shift()));
-      // Re-auth if user logged in
-      if (state.user) this.auth(state.user.id);
-    };
-
-    this.socket.onclose = () => {
-      this.connected = false;
-      this._scheduleReconnect();
-    };
-
-    this.socket.onerror = () => {
-      this.connected = false;
-    };
-
-    this.socket.onmessage = (event) => {
-      let msg;
-      try { msg = JSON.parse(event.data); } catch { return; }
-      WS._handleMessage(msg);
-    };
-  },
-
-  _scheduleReconnect() {
-    clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = setTimeout(() => this.connect(), 3000);
-  },
-
-  send(msg) {
-    if (this.connected && this.socket?.readyState === WebSocket.OPEN) {
-      this.socket.send(JSON.stringify(msg));
-    } else {
-      this.queue.push(msg);
-    }
-  },
-
-  auth(userId) {
-    this.send({ type: 'auth', userId });
-  },
-
-  _handleMessage(msg) {
-    switch (msg.type) {
-
-      case 'user_update': {
-        const { user } = msg;
-        // Update in local users array
-        const users = DB.getUsers();
-        const idx = users.findIndex(u => u.id === user.id);
-        if (idx >= 0) {
-          users[idx] = { ...users[idx], isSeller: user.isSeller, isAdmin: user.isAdmin };
-          DB.setUsers(users);
-        }
-        // Update current session if it's THIS user
-        if (state.user && state.user.id === user.id) {
-          const wasNotSeller = !state.user.isSeller;
-          state.user = { ...state.user, isSeller: user.isSeller, isAdmin: user.isAdmin };
-          DB.setCurrent(state.user);
-          if (wasNotSeller && user.isSeller) {
-            // Add local notification
-            const notifs = DB.getNotifs();
-            notifs.push({ id: uid(), userId: user.id, type: 'promotion', message: '🎉 Parabéns! Você foi promovido a vendedor no REDZIN MARKET!', read: false, createdAt: new Date().toISOString() });
-            DB.setNotifs(notifs);
-            toast('🎉 Você foi promovido a Vendedor!', 'success');
-          }
-          renderNav();
-        }
-        break;
-      }
-
-      case 'chats_init': {
-        // Server sends all chat rooms for this user on auth
-        const { chats } = msg;
-        DB.setChats(chats);
-        if (chatState.open && chatState.roomId) renderChatMessages();
-        checkUnreadBadges();
-        break;
-      }
-
-      case 'chat_room': {
-        // Server confirms room created/opened
-        const { roomId, room } = msg;
-        const chats = DB.getChats();
-        chats[roomId] = room;
-        DB.setChats(chats);
-        if (chatState.roomId === roomId) renderChatMessages();
-        break;
-      }
-
-      case 'new_message': {
-        // Real-time message delivery via WebSocket (for recipients, NOT sender)
-        const { roomId, message } = msg;
-        const chats = DB.getChats();
-        if (!chats[roomId]) chats[roomId] = { participants: [], messages: [] };
-        // Avoid duplicate: don't add if already exists with same id
-        const already = chats[roomId].messages.find(m => m.id === message.id);
-        if (!already) chats[roomId].messages.push(message);
-        DB.setChats(chats);
-
-        if (chatState.open && chatState.roomId === roomId) {
-          WS.send({ type: 'chat_read', roomId, userId: state.user?.id });
-          renderChatMessages();
-        } else {
-          checkUnreadBadges();
-          if (state.user && message.senderId !== state.user.id) {
-            const sender = DB.getUsers().find(u => u.id === message.senderId);
-            if (sender) toast(`💬 ${sender.username}: ${message.text.slice(0, 50)}`, 'info');
-          }
-        }
-        break;
-      }
-
-      case 'message_sent': {
-        // Server confirms our sent message — replace optimistic copy with server version
-        const { roomId, message } = msg;
-        const chats = DB.getChats();
-        if (!chats[roomId]) break;
-        // Remove optimistic copy and replace with authoritative server message
-        chats[roomId].messages = chats[roomId].messages.filter(m => !m._optimistic);
-        const already = chats[roomId].messages.find(m => m.id === message.id);
-        if (!already) chats[roomId].messages.push(message);
-        DB.setChats(chats);
-        if (chatState.open && chatState.roomId === roomId) renderChatMessages();
-        break;
-      }
-
-      case 'chat_read_ack': {
-        const { roomId } = msg;
-        const chats = DB.getChats();
-        if (chats[roomId]) {
-          chats[roomId].messages.forEach(m => {
-            if (m.senderId === state.user?.id) m.read = true;
-          });
-          DB.setChats(chats);
-        }
-        checkUnreadBadges();
-        break;
-      }
-
-      case 'promote_ack': {
-        const { userId, isSeller, user: updatedUser } = msg;
-        // Update local users list directly
-        const users = DB.getUsers();
-        const idx = users.findIndex(u => u.id === userId);
-        if (idx >= 0) {
-          users[idx].isSeller = isSeller;
-          if (updatedUser) users[idx] = { ...users[idx], ...updatedUser };
-          DB.setUsers(users);
-        }
-        // If promoted user is currently logged in on this tab, update session
-        if (state.user && state.user.id === userId) {
-          state.user = { ...state.user, isSeller };
-          DB.setCurrent(state.user);
-        }
-        toast(isSeller ? 'Usuário promovido a vendedor!' : 'Status de vendedor removido', 'success');
-        // Re-render admin panel WITHOUT calling get_users (would loop)
-        // Just update the DOM directly
-        const mainEl = document.getElementById('main');
-        if (mainEl && state.route === 'admin-users') {
-          mainEl.innerHTML = renderAdminUsersHTML();
-        }
-        renderNav();
-        break;
-      }
-
-      case 'users_list': {
-        // Server sends fresh user list — update local store WITHOUT calling render()
-        const { users } = msg;
-        const localUsers = DB.getUsers();
-        const merged = users.map(su => {
-          const lu = localUsers.find(u => u.id === su.id);
-          return lu ? { ...lu, isSeller: su.isSeller, isAdmin: su.isAdmin } : su;
-        });
-        localUsers.forEach(lu => {
-          if (!merged.find(u => u.id === lu.id)) merged.push(lu);
-        });
-        DB.setUsers(merged);
-        // Re-render admin panel directly if on that page
-        const mainEl = document.getElementById('main');
-        if (mainEl && state.route === 'admin-users') {
-          mainEl.innerHTML = renderAdminUsersHTML();
-        }
-        break;
-      }
-    }
-  },
-};
-
-// ─── STORAGE: in-memory-first, localStorage as persistence ───
-// All reads/writes go through _store (in-memory object).
-// localStorage is synced as a best-effort persistence layer.
-// sessionStorage is replaced entirely with _session (in-memory).
-const _store = {};   // replaces localStorage
-const _session = {}; // replaces sessionStorage
-
-function stGet(k, def) {
-  if (k in _store) {
-    try { return JSON.parse(_store[k]) ?? def; } catch(e) { return def; }
-  }
-  // Try to hydrate from localStorage on first access
-  try {
-    const v = localStorage.getItem(k);
-    if (v !== null) { _store[k] = v; return JSON.parse(v) ?? def; }
-  } catch(e) {}
-  return def;
-}
-function stSet(k, v) {
-  const s = JSON.stringify(v);
-  _store[k] = s;
-  try { localStorage.setItem(k, s); } catch(e) {}
-}
-function ssGet(k, def = null) {
-  if (k in _session) {
-    try { return JSON.parse(_session[k]) ?? def; } catch(e) { return def; }
-  }
-  try {
-    const v = sessionStorage.getItem(k);
-    if (v !== null) { _session[k] = v; return JSON.parse(v) ?? def; }
-  } catch(e) {}
-  return def;
-}
-function ssSet(k, v) {
-  _session[k] = JSON.stringify(v);
-  try { sessionStorage.setItem(k, JSON.stringify(v)); } catch(e) {}
-}
-function ssRemove(k) {
-  delete _session[k];
-  try { sessionStorage.removeItem(k); } catch(e) {}
-}
-
-// ─── DATABASE ────────────────────────────────────────────────
-const DB = {
-  get: (k, def = []) => stGet(k, def),
-  set: (k, v) => stSet(k, v),
-  getUsers: () => DB.get('rm_users', []),
-  setUsers: v => DB.set('rm_users', v),
-  getProducts: () => DB.get('rm_products', []),
-  setProducts: v => DB.set('rm_products', v),
-  getOrders: () => DB.get('rm_orders', []),
-  setOrders: v => DB.set('rm_orders', v),
-  getCart: () => DB.get('rm_cart', []),
-  setCart: v => DB.set('rm_cart', v),
-  getFavs: () => DB.get('rm_favs', []),
-  setFavs: v => DB.set('rm_favs', v),
-  getCoupons: () => DB.get('rm_coupons', []),
-  setCoupons: v => DB.set('rm_coupons', v),
-  getNotifs: () => DB.get('rm_notifs', []),
-  setNotifs: v => DB.set('rm_notifs', v),
-  getCurrent: () => DB.get('rm_current', null),
-  setCurrent: v => DB.set('rm_current', v),
-  getChats: () => DB.get('rm_chats', {}),
-  setChats: v => DB.set('rm_chats', v),
-  getChatRoom: (roomId) => {
-    const chats = DB.getChats();
-    return chats[roomId] || { messages: [], participants: [] };
-  },
-  setChatRoom: (roomId, room) => {
-    const chats = DB.getChats();
-    chats[roomId] = room;
-    DB.setChats(chats);
-    // Trigger in-page chat update immediately (same tab, same memory)
-    window.dispatchEvent(new CustomEvent('rm_chats_updated', { detail: { roomId } }));
-  },
-};
-
-// ─── CHAT STATE ───────────────────────────────────────────────
-let chatState = {
-  open: false,
-  roomId: null,
-  otherUserId: null,
-  pollInterval: null,
-  lastMsgCount: 0,
-};
-
-// ─── GLOBAL ORDER DATA (fixes inline JSON onclick bug) ────────
-let _pendingOrderData = null;
-
-// ─── STATE ───────────────────────────────────────────────────
-let state = {
-  route: 'home',
-  params: {},
-  user: null,
-  searchQuery: '',
-  selectedCategory: 'all',
-};
-
-// ─── INIT ────────────────────────────────────────────────────
-function init() {
-  let users = DB.getUsers();
-  if (!users.find(u => u.username === 'Redzin')) {
-    users.push({
-      id: 'redzin',
-      username: 'Redzin',
-      password: '022141530',
-      email: 'redzin@market.com',
-      phone: '',
-      avatar: `https://api.dicebear.com/7.x/initials/svg?seed=Redzin&backgroundColor=ffffff&textColor=000000`,
-      isSeller: true,
-      isAdmin: true,
-      createdAt: new Date().toISOString(),
-      bio: 'Vendedor Oficial REDZIN MARKET',
-      pixKey: 'redzin@market.com',
-      pixKeyType: 'email',
-    });
-    DB.setUsers(users);
-  }
-
-  if (DB.getProducts().length === 0) seedProducts();
-
-  // Load current user — always cross-reference with users array to get latest data (e.g. isSeller promotions)
-  const savedCurrent = DB.getCurrent();
-  if (savedCurrent) {
-    const freshUser = DB.getUsers().find(u => u.id === savedCurrent.id);
-    state.user = freshUser || savedCurrent;
-    if (freshUser) DB.setCurrent(freshUser); // refresh rm_current with latest
-  } else {
-    state.user = null;
-  }
-  hashRoute();
-  window.addEventListener('hashchange', hashRoute);
-  renderNav();
-
-  // Connect WebSocket (real-time chat + user updates)
-  WS.connect();
-
-  // If user was already logged in, re-auth with server on connect
-  // Server will send back authoritative user data (isSeller, etc.)
-  if (state.user) {
-    // WS.connect() will call WS.auth when connected (in onopen handler)
-    // But since connect is async, queue the auth
-    WS.queue.push({ type: 'auth', userId: state.user.id });
-  }
-
-  startChatPoll();
-
-  // Listen to in-page chat updates (works even when localStorage is blocked)
-  window.addEventListener('rm_chats_updated', () => {
-    if (chatState.open && chatState.roomId) {
-      renderChatMessages();
-    }
-    if (state.user) checkUnreadBadges();
-  });
-  // Also listen to cross-tab storage events (another browser tab)
-  window.addEventListener('storage', (e) => {
-    if (e.key && e.newValue !== null) {
-      // Invalidate in-memory cache so next read picks up the fresh value from localStorage
-      _store[e.key] = e.newValue;
-    }
-    if (e.key === 'rm_chats') {
-      if (chatState.open && chatState.roomId) renderChatMessages();
-      if (state.user) checkUnreadBadges();
-    }
-    if (e.key === 'rm_notifs' && state.user) {
-      renderNav();
-    }
-  });
-
-  // Close dropdown on outside click
-  document.addEventListener('click', (e) => {
-    const wrap = document.getElementById('user-bubble-wrap');
-    if (wrap && !wrap.contains(e.target)) {
-      closeUserMenu();
-    }
-    // Close search bar on outside click
-    const bar = document.getElementById('mobile-search-bar');
-    const btn = document.getElementById('search-toggle-btn');
-    if (bar && bar.classList.contains('visible') && !bar.contains(e.target) && !btn.contains(e.target)) {
-      bar.classList.remove('visible');
-    }
-  });
-
-  // Handle viewport resize (keyboard open/close on mobile)
-  window.addEventListener('resize', handleViewportResize);
-}
-
-function handleViewportResize() {
-  if (chatState.open) {
-    const panel = document.getElementById('chat-panel');
-    if (panel && window.innerWidth <= 640) {
-      const navH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--nav-h')) || 52;
-      panel.style.height = `${window.innerHeight - navH}px`;
-    }
-  }
-}
-
-function seedProducts() {
-  const products = [
-    { id: uid(), sellerId: 'redzin', title: 'Tênis Preto Minimalista', price: 289.90, originalPrice: 389.90, images: ['https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=400'], category: 'moda', stock: 15, sold: 42, description: 'Tênis moderno em couro sintético preto.', createdAt: new Date().toISOString() },
-    { id: uid(), sellerId: 'redzin', title: 'Relógio Minimalista Branco', price: 499.00, originalPrice: null, images: ['https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=400'], category: 'acessorios', stock: 8, sold: 17, description: 'Relógio clean e elegante.', createdAt: new Date().toISOString() },
-    { id: uid(), sellerId: 'redzin', title: 'Mochila Urbana Preta', price: 179.90, originalPrice: 220.00, images: ['https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=400'], category: 'bolsas', stock: 20, sold: 93, description: 'Mochila resistente para o dia a dia.', createdAt: new Date().toISOString() },
-    { id: uid(), sellerId: 'redzin', title: 'Óculos Escuros Retrô', price: 129.00, originalPrice: 180.00, images: ['https://images.unsplash.com/photo-1572635196237-14b3f281503f?w=400'], category: 'acessorios', stock: 30, sold: 210, description: 'Armação clássica em acetato preto.', createdAt: new Date().toISOString() },
-    { id: uid(), sellerId: 'redzin', title: 'Camiseta Oversized Branca', price: 89.90, originalPrice: null, images: ['https://images.unsplash.com/photo-1583743814966-8936f5b7be1a?w=400'], category: 'moda', stock: 50, sold: 312, description: 'Algodão premium 100%.', createdAt: new Date().toISOString() },
-    { id: uid(), sellerId: 'redzin', title: 'Headphone Sem Fio Premium', price: 799.00, originalPrice: 999.00, images: ['https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=400'], category: 'eletronicos', stock: 5, sold: 28, description: 'Áudio imersivo, cancelamento de ruído.', createdAt: new Date().toISOString() },
-    { id: uid(), sellerId: 'redzin', title: 'Carteira Slim de Couro', price: 119.00, originalPrice: null, images: ['https://images.unsplash.com/photo-1627123424574-724758594e93?w=400'], category: 'acessorios', stock: 25, sold: 74, description: 'Couro legítimo, ultrafina.', createdAt: new Date().toISOString() },
-    { id: uid(), sellerId: 'redzin', title: 'Boné Estruturado Preto', price: 69.90, originalPrice: 89.90, images: ['https://images.unsplash.com/photo-1588850561407-ed78c282e89b?w=400'], category: 'moda', stock: 40, sold: 156, description: 'Estilo streetwear premium.', createdAt: new Date().toISOString() },
-  ];
-  DB.setProducts(products);
-}
-
-// ─── UTILS ───────────────────────────────────────────────────
+// ===== UTILS =====
 function uid() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
-function fmt(v) { return new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v); }
-function timeAgo(iso) {
-  const d = Date.now() - new Date(iso).getTime();
-  const m = Math.floor(d / 60000);
-  if (m < 1) return 'agora';
-  if (m < 60) return `${m}m atrás`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h atrás`;
-  return `${Math.floor(h / 24)}d atrás`;
+function fmt(n) { return 'R$ ' + (n || 0).toFixed(2).replace('.', ','); }
+function timeAgo(d) {
+  var s = Math.floor((Date.now() - new Date(d)) / 1000);
+  if (s < 60) return 'agora';
+  if (s < 3600) return Math.floor(s / 60) + 'min';
+  if (s < 86400) return Math.floor(s / 3600) + 'h';
+  return Math.floor(s / 86400) + 'd';
 }
-function chatTime(iso) {
-  const d = new Date(iso);
-  return d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+function toast(msg, type) {
+  var c = document.getElementById('toasts');
+  var el = document.createElement('div');
+  el.className = 'toast ' + (type || 'info');
+  el.textContent = msg;
+  c.appendChild(el);
+  setTimeout(function() { el.remove(); }, 3000);
 }
-
-function toast(msg, type = 'info') {
-  const el = document.createElement('div');
-  el.className = `toast ${type}`;
-  const icons = { success: '✓', error: '✕', info: 'ℹ' };
-  el.innerHTML = `<span>${icons[type] || 'ℹ'}</span> ${msg}`;
-  document.getElementById('toast-container').appendChild(el);
-  setTimeout(() => el.remove(), 3500);
-}
-
-function modal(html) {
-  const c = document.getElementById('modal-container');
-  c.innerHTML = `<div class="modal-overlay" id="modal-overlay">${html}</div>`;
-  document.getElementById('modal-overlay').addEventListener('click', e => {
-    if (e.target.id === 'modal-overlay') closeModal();
-  });
-  document.body.style.overflow = 'hidden';
-}
-
-function closeModal() {
-  document.getElementById('modal-container').innerHTML = '';
-  document.body.style.overflow = '';
-}
-
-function navigate(route, params = {}) {
-  state.route = route;
-  state.params = params;
-  const hash = params.id ? `#${route}/${params.id}` : `#${route}`;
-  history.pushState(null, '', hash);
+function go(page, params) {
+  state.page = page;
+  state.params = params || {};
+  closeDropdown();
   render();
   window.scrollTo(0, 0);
-  closeUserMenu();
+}
+function api(method, url, body) {
+  var opts = { method: method, headers: { 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  return fetch(API + url, opts).then(function(r) { return r.json(); });
 }
 
-function hashRoute() {
-  const hash = location.hash.replace('#', '') || 'home';
-  const parts = hash.split('/');
-  state.route = parts[0];
-  state.params = parts[1] ? { id: parts[1] } : {};
-  render();
-}
-
-function toggleMobileSearch() {
-  const bar = document.getElementById('mobile-search-bar');
-  bar.classList.toggle('visible');
-  if (bar.classList.contains('visible')) {
-    document.getElementById('mobile-search-input')?.focus();
-  }
-}
-
-function mobileSearch() {
-  const q = document.getElementById('mobile-search-input')?.value || '';
-  state.searchQuery = q.trim();
-  state.route = 'home';
-  const bar = document.getElementById('mobile-search-bar');
-  bar.classList.remove('visible');
-  render();
-}
-
-function handleProfileNav() {
-  if (state.user) navigate('profile');
-  else showLogin();
-}
-
-// ─── USER MENU DROPDOWN ───────────────────────────────────────
-function toggleUserMenu() {
-  const dropdown = document.getElementById('user-dropdown');
-  if (!dropdown) return;
-  const isOpen = dropdown.style.display !== 'none';
-  if (isOpen) {
-    closeUserMenu();
-  } else {
-    openUserMenu();
-  }
-}
-
-function openUserMenu() {
-  const dropdown = document.getElementById('user-dropdown');
-  if (dropdown) {
-    dropdown.style.display = 'block';
-    dropdown.style.animation = 'fadeScale 0.15s ease';
-  }
-}
-
-function closeUserMenu() {
-  const dropdown = document.getElementById('user-dropdown');
-  if (dropdown) dropdown.style.display = 'none';
-}
-
-// ─── CHAT BADGE / UNREAD ──────────────────────────────────────
-function checkUnreadBadges() {
-  if (!state.user) return;
-  const chats = DB.getChats();
-  let unread = 0;
-  Object.entries(chats).forEach(([, room]) => {
-    if (!room.participants?.includes(state.user.id)) return;
-    (room.messages || []).forEach(m => {
-      if (m.senderId !== state.user.id && !m.read) unread++;
-    });
-  });
-  // Update dropdown badge
-  const chatBadgeEl = document.getElementById('dd-chat-badge');
-  if (chatBadgeEl) {
-    chatBadgeEl.textContent = unread;
-    chatBadgeEl.style.display = unread > 0 ? 'inline-flex' : 'none';
-  }
-}
-
-// ─── CHAT SYSTEM ─────────────────────────────────────────────
-function getChatRoomId(userId1, userId2) {
-  return [userId1, userId2].sort().join('__');
-}
-
-function openChat(otherUserId, productContext = null) {
-  if (!state.user) { showLogin(); return; }
-  if (otherUserId === state.user.id) { toast('Não pode conversar consigo mesmo', 'info'); return; }
-
-  const otherUser = DB.getUsers().find(u => u.id === otherUserId);
-  if (!otherUser) return;
-
-  const roomId = getChatRoomId(state.user.id, otherUserId);
-  chatState.roomId = roomId;
-  chatState.otherUserId = otherUserId;
-
-  let room = DB.getChatRoom(roomId);
-  // Always request room from server — gets latest messages and creates if new
-  WS.send({ type: 'chat_open', userId: state.user.id, otherUserId, productContext });
-
-  document.getElementById('chat-panel-avatar').src = otherUser.avatar || '';
-  document.getElementById('chat-panel-name').textContent = otherUser.username;
-  document.getElementById('chat-panel-status').textContent = 'online';
-
-  const panel = document.getElementById('chat-panel');
-  const overlay = document.getElementById('chat-overlay');
-  panel.classList.add('open');
-  overlay.classList.add('visible');
-  chatState.open = true;
-
-  // Resize panel properly on mobile
-  if (window.innerWidth <= 640) {
-    const navH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--nav-h')) || 52;
-    panel.style.height = `${window.innerHeight - navH}px`;
-  }
-
-  renderChatMessages();
-  setTimeout(() => {
-    const input = document.getElementById('chat-input');
-    if (input) {
-      input.focus();
-      // Scroll to bottom of messages
-      const msgs = document.getElementById('chat-messages');
-      if (msgs) msgs.scrollTop = msgs.scrollHeight;
-    }
-  }, 350);
-}
-
-function closeChatPanel() {
-  const panel = document.getElementById('chat-panel');
-  const overlay = document.getElementById('chat-overlay');
-  panel.classList.remove('open');
-  panel.style.height = '';
-  overlay.classList.remove('visible');
-  chatState.open = false;
-  chatState.roomId = null;
-}
-
-function sendChatMessage() {
-  if (!state.user || !chatState.roomId) return;
-  const input = document.getElementById('chat-input');
-  if (!input) return;
-  const text = input.value.trim();
-  if (!text) return;
-
-  input.value = '';
-
-  // Add optimistic message immediately for instant feedback
-  const chats = DB.getChats();
-  const tempId = '_opt_' + uid();
-  if (!chats[chatState.roomId]) chats[chatState.roomId] = { participants: [state.user.id, chatState.otherUserId], messages: [] };
-  chats[chatState.roomId].messages.push({
-    id: tempId,
-    senderId: state.user.id,
-    text,
-    time: new Date().toISOString(),
-    read: false,
-    _optimistic: true,
-  });
-  DB.setChats(chats);
-  renderChatMessages();
-
-  // Send via WebSocket — server will respond with message_sent (for us) + new_message (for other)
-  WS.send({ type: 'chat_message', roomId: chatState.roomId, senderId: state.user.id, text });
-}
-
-function renderChatMessages() {
-  if (!chatState.roomId) return;
-  const room = DB.getChatRoom(chatState.roomId);
-  const msgs = room.messages || [];
-
-  let updated = false;
-  msgs.forEach(m => {
-    if (m.senderId !== state.user?.id && !m.read) {
-      m.read = true;
-      updated = true;
-    }
-  });
-  if (updated) {
-    room.messages = msgs;
-    DB.setChatRoom(chatState.roomId, room);
-    // Notify server messages are read
-    WS.send({ type: 'chat_read', roomId: chatState.roomId, userId: state.user?.id });
-    checkUnreadBadges();
-  }
-
-  const container = document.getElementById('chat-messages');
-  if (!container) return;
-
-  container.innerHTML = msgs.length === 0
-    ? `<div style="color:var(--text3);text-align:center;margin-top:32px;font-size:13px">Nenhuma mensagem ainda.<br>Diga olá! 👋</div>`
-    : msgs.map(m => {
-        if (m.senderId === '__system__') {
-          return `<div class="chat-system-msg">${m.text}</div>`;
-        }
-        const isSent = m.senderId === state.user?.id;
-        return `<div class="chat-msg ${isSent ? 'sent' : 'received'}">
-          ${m.text}
-          <span class="chat-msg-time">${chatTime(m.time)}</span>
-        </div>`;
-      }).join('');
-
-  chatState.lastMsgCount = msgs.length;
-  container.scrollTop = container.scrollHeight;
-}
-
-function startChatPoll() {
-  chatState.pollInterval = setInterval(() => {
-    if (chatState.open && chatState.roomId) {
-      const room = DB.getChatRoom(chatState.roomId);
-      const count = room.messages?.length || 0;
-      if (count !== chatState.lastMsgCount) {
-        renderChatMessages();
-      }
-    }
-    if (state.user) checkUnreadBadges();
-  }, 1500);
-}
-
-function getUnreadChatCount() {
-  if (!state.user) return 0;
-  const chats = DB.getChats();
-  let unread = 0;
-  Object.entries(chats).forEach(([, room]) => {
-    if (!room.participants?.includes(state.user.id)) return;
-    (room.messages || []).forEach(m => {
-      if (m.senderId !== state.user.id && !m.read) unread++;
-    });
-  });
-  return unread;
-}
-
-// ─── NAV RENDER ──────────────────────────────────────────────
-function renderNav() {
-  const u = state.user;
-  const notifs = u ? DB.getNotifs().filter(n => n.userId === u.id && !n.read).length : 0;
-  const cartCount = u ? DB.getCart().filter(c => c.userId === u.id).length : 0;
-  const chatUnread = getUnreadChatCount();
-
-  const bubble = document.getElementById('user-bubble');
-  const dropdown = document.getElementById('user-dropdown');
-  if (!bubble || !dropdown) return;
-
-  if (!u) {
-    bubble.innerHTML = `<span style="font-size:18px;line-height:1">👤</span>`;
-    dropdown.innerHTML = `
-      <div class="dropdown-item" onclick="closeUserMenu();showLogin()">🔑 Entrar</div>
-      <div class="dropdown-item" onclick="closeUserMenu();showRegister()">✨ Criar conta</div>
-    `;
-  } else {
-    bubble.innerHTML = `<img src="${u.avatar}" alt="${u.username}" onerror="this.src='https://api.dicebear.com/7.x/initials/svg?seed=${u.username}'">`;
-    dropdown.innerHTML = `
-      <div class="dropdown-header">
-        <img src="${u.avatar}" style="width:36px;height:36px;border-radius:50%;object-fit:cover;border:2px solid var(--border2);flex-shrink:0" onerror="this.src='https://api.dicebear.com/7.x/initials/svg?seed=${u.username}'">
-        <div>
-          <div style="font-size:13px;font-weight:600;color:var(--text)">${u.username}</div>
-          <div style="font-size:10px;color:${u.isAdmin ? 'var(--success)' : u.isSeller ? 'var(--success)' : 'var(--text3)'}">${u.isAdmin ? '⭐ Admin' : u.isSeller ? '✓ Vendedor' : 'Comprador'}</div>
-        </div>
-      </div>
-      <div class="dropdown-divider"></div>
-      <div class="dropdown-item" onclick="closeUserMenu();navigate('profile')">👤 Meu Perfil</div>
-      <div class="dropdown-item" onclick="closeUserMenu();navigate('cart')">
-        🛒 Carrinho
-        ${cartCount > 0 ? `<span class="dropdown-badge">${cartCount}</span>` : ''}
-      </div>
-      <div class="dropdown-item" onclick="closeUserMenu();navigate('notifications')">
-        🔔 Notificações
-        ${notifs > 0 ? `<span class="dropdown-badge">${notifs}</span>` : ''}
-      </div>
-      <div class="dropdown-item" onclick="closeUserMenu();navigate('favorites')">❤ Favoritos</div>
-      <div class="dropdown-item" onclick="closeUserMenu();navigate('orders')">📦 Meus Pedidos</div>
-      ${u.isSeller ? `
-        <div class="dropdown-divider"></div>
-        <div class="dropdown-item" onclick="closeUserMenu();navigate('seller-dashboard')">🏪 Painel do Vendedor</div>
-      ` : ''}
-      ${u.isAdmin ? `
-        <div class="dropdown-item" onclick="closeUserMenu();navigate('admin-users')">⚙ Gerenciar Usuários</div>
-      ` : ''}
-      <div class="dropdown-divider"></div>
-      <div class="dropdown-item danger" onclick="closeUserMenu();doLogout()">🚪 Sair</div>
-    `;
-  }
-}
-
-// ─── MAIN RENDER ─────────────────────────────────────────────
-function render() {
-  renderNav();
-  const main = document.getElementById('main');
-  const routes = {
-    home: renderHome,
-    product: renderProduct,
-    profile: renderProfile,
-    'seller-profile': renderSellerProfile,
-    cart: renderCart,
-    favorites: renderFavorites,
-    checkout: renderCheckout,
-    payment: renderPayment,
-    tracking: renderTracking,
-    'seller-dashboard': renderSellerDashboard,
-    'seller-products': renderSellerProducts,
-    'add-product': renderAddProduct,
-    'edit-product': renderEditProduct,
-    'seller-coupons': renderSellerCoupons,
-    'seller-pix': renderSellerPix,
-    notifications: renderNotifications,
-    'admin-users': renderAdminUsers,
-    orders: renderOrders,
-    'my-chats': renderMyChats,
+// ===== WEBSOCKET =====
+function connectWS() {
+  var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host);
+  ws.onopen = function() { if (state.user) ws.send(JSON.stringify({ type: 'auth', userId: state.user.id })); };
+  ws.onmessage = function(e) {
+    var msg = JSON.parse(e.data);
+    if (msg.type === 'chat_room') renderChatRoom(msg.roomId, msg.messages);
+    if (msg.type === 'new_message') appendChatMsg(msg.message);
   };
-
-  const fn = routes[state.route];
-  if (fn) main.innerHTML = fn();
-  else main.innerHTML = renderHome();
-  attachEvents();
+  ws.onclose = function() { setTimeout(connectWS, 3000); };
 }
+function wsSend(msg) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg)); }
 
-// ─── HOME PAGE ───────────────────────────────────────────────
-function renderHome() {
-  const categories = ['all', 'moda', 'eletronicos', 'acessorios', 'bolsas', 'beleza', 'casa', 'esporte'];
-  const catLabels = { all: 'Todos', moda: 'Moda', eletronicos: 'Eletrônicos', acessorios: 'Acessórios', bolsas: 'Bolsas', beleza: 'Beleza', casa: 'Casa', esporte: 'Esporte' };
-
-  let prods = DB.getProducts();
-  if (state.searchQuery) {
-    const q = state.searchQuery.toLowerCase();
-    prods = prods.filter(p => p.title.toLowerCase().includes(q) || p.description.toLowerCase().includes(q));
+// ===== DROPDOWN =====
+function toggleMenu() {
+  var dd = document.getElementById('dropdown');
+  var ov = document.getElementById('dropdown-overlay');
+  if (dd.classList.contains('show')) {
+    closeDropdown();
+    return;
   }
-  if (state.selectedCategory && state.selectedCategory !== 'all') {
-    prods = prods.filter(p => p.category === state.selectedCategory);
+  var html = '';
+  if (state.user) {
+    html += '<div class="dd-header"><img src="' + state.user.avatar + '"><div>';
+    html += '<div style="font-weight:600">' + state.user.username + '</div>';
+    html += '<div style="font-size:11px;color:var(--text3)">' + (state.user.isSeller ? 'Vendedor' : 'Comprador') + '</div>';
+    html += '</div></div>';
+    html += '<div class="dd-item" onclick="go(\'profile\')">👤 Meu Perfil</div>';
+    html += '<div class="dd-item" onclick="go(\'orders\')">📦 Meus Pedidos</div>';
+    html += '<div class="dd-item" onclick="go(\'notifications\')">🔔 Notificações</div>';
+    if (state.user.isSeller) html += '<div class="dd-item" onclick="go(\'seller-dashboard\')">💰 Painel Vendedor</div>';
+    if (state.user.isAdmin) html += '<div class="dd-item" onclick="go(\'admin-users\')">⚙️ Gerenciar Usuários</div>';
+    html += '<div class="dd-divider"></div>';
+    html += '<div class="dd-item danger" onclick="logout()">🚪 Sair</div>';
+  } else {
+    html += '<div class="dd-item" onclick="showLogin()">🔑 Entrar</div>';
+    html += '<div class="dd-item" onclick="showRegister()">📝 Criar conta</div>';
   }
-
-  const favs = state.user ? DB.getFavs().filter(f => f.userId === state.user.id).map(f => f.productId) : [];
-  const coupons = DB.getCoupons();
-
-  const heroHtml = !state.searchQuery ? `
-    <div class="hero">
-      <h1>REDZIN<br><span>MARKET</span></h1>
-      <p>A loja minimalista que você merece</p>
-    </div>
-  ` : `
-    <div style="padding:14px 16px;border-bottom:1px solid var(--border);background:var(--bg2);">
-      <p style="color:var(--text2);font-size:13px;">Resultados para: <strong style="color:var(--text)">"${state.searchQuery}"</strong> — ${prods.length} produto(s)
-      <button onclick="state.searchQuery='';render()" style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:12px;margin-left:8px">✕ Limpar</button></p>
-    </div>
-  `;
-
-  const catsHtml = `
-    <div class="categories-bar">
-      ${categories.map(c => `<button class="cat-chip ${state.selectedCategory === c ? 'active' : ''}" onclick="setCategory('${c}')">${catLabels[c]}</button>`).join('')}
-    </div>
-  `;
-
-  const productsHtml = prods.length === 0 ? `
-    <div class="empty-state">
-      <div class="icon">🛍️</div>
-      <h3>Nenhum produto encontrado</h3>
-      <p>Tente buscar por outro termo</p>
-    </div>
-  ` : `
-    <div class="product-grid">
-      ${prods.map(p => renderProductCard(p, favs, coupons)).join('')}
-    </div>
-  `;
-
-  return `
-    ${heroHtml}
-    ${catsHtml}
-    <div class="page-container">
-      <div class="section-title">— PRODUTOS</div>
-      ${productsHtml}
-    </div>
-  `;
+  dd.innerHTML = html;
+  dd.classList.add('show');
+  ov.classList.add('show');
+}
+function closeDropdown() {
+  document.getElementById('dropdown').classList.remove('show');
+  document.getElementById('dropdown-overlay').classList.remove('show');
 }
 
-function renderProductCard(p, favs, coupons) {
-  const isFav = favs.includes(p.id);
-  const applicable = coupons.filter(c => c.sellerId === p.sellerId && c.active);
-  const bestDiscount = applicable.length > 0 ? Math.max(...applicable.map(c => c.discount)) : 0;
-  const discountedPrice = bestDiscount > 0 ? p.price * (1 - bestDiscount / 100) : p.price;
-
-  return `
-    <div class="product-card" onclick="navigate('product', {id:'${p.id}'})">
-      ${bestDiscount > 0 ? `<span class="discount-badge">-${bestDiscount}%</span>` : ''}
-      <button class="product-card-fav ${isFav ? 'active' : ''}" onclick="event.stopPropagation();toggleFav('${p.id}')">${isFav ? '❤' : '♡'}</button>
-      <img class="product-card-img" src="${p.images[0]}" alt="${p.title}" loading="lazy" onerror="this.src='https://via.placeholder.com/300x300/111111/444444?text=IMG'">
-      <div class="product-card-info">
-        <div class="product-card-title">${p.title}</div>
-        <div class="product-card-price">
-          ${fmt(discountedPrice)}
-          ${bestDiscount > 0 ? `<span class="original">${fmt(p.price)}</span>` : ''}
-          ${p.originalPrice && !bestDiscount ? `<span class="original">${fmt(p.originalPrice)}</span>` : ''}
-        </div>
-        <div class="product-card-sold">${p.sold || 0} vendidos</div>
-      </div>
-    </div>
-  `;
-}
-
-function setCategory(cat) {
-  state.selectedCategory = cat;
-  render();
-}
-
-// ─── PRODUCT DETAIL ──────────────────────────────────────────
-function renderProduct() {
-  const p = DB.getProducts().find(p => p.id === state.params.id);
-  if (!p) return `<div class="page-container"><div class="empty-state"><div class="icon">😕</div><h3>Produto não encontrado</h3></div></div>`;
-
-  const seller = DB.getUsers().find(u => u.id === p.sellerId) || {};
-  const favs = state.user ? DB.getFavs().filter(f => f.userId === state.user.id).map(f => f.productId) : [];
-  const isFav = favs.includes(p.id);
-  const coupons = DB.getCoupons().filter(c => c.sellerId === p.sellerId && c.active);
-  const bestDiscount = coupons.length > 0 ? Math.max(...coupons.map(c => c.discount)) : 0;
-  const displayPrice = bestDiscount > 0 ? p.price * (1 - bestDiscount / 100) : p.price;
-
-  const thumbs = p.images.length > 1 ? p.images.map((img, i) => `
-    <img class="product-thumb ${i === 0 ? 'active' : ''}" src="${img}" alt="" onclick="switchImg(this, '${img}')" onerror="this.style.display='none'">
-  `).join('') : '';
-
-  const isOwnProduct = state.user && state.user.id === p.sellerId;
-
-  return `
-    <div class="page-container" style="padding-top:24px">
-      <button class="btn btn-outline btn-sm" style="margin-bottom:20px" onclick="history.back()">← Voltar</button>
-      <div class="product-detail">
-        <div class="product-images">
-          <img class="product-main-img" id="main-img" src="${p.images[0]}" alt="${p.title}" onerror="this.src='https://via.placeholder.com/500x500/111111/444444?text=IMG'">
-          ${thumbs ? `<div class="product-thumbs">${thumbs}</div>` : ''}
-        </div>
-        <div class="product-info-panel">
-          <h1>${p.title}</h1>
-          <div class="product-meta">
-            <span>⭐ 4.8</span>
-            <span>${p.sold || 0} vendidos</span>
-            <span>${p.stock > 0 ? `${p.stock} em estoque` : '<span style="color:var(--danger)">Sem estoque</span>'}</span>
-          </div>
-          <div class="product-price-big">
-            ${fmt(displayPrice)}
-            ${p.originalPrice && !bestDiscount ? `<span class="orig-price">${fmt(p.originalPrice)}</span>` : ''}
-            ${bestDiscount > 0 ? `<span class="orig-price">${fmt(p.price)}</span>` : ''}
-          </div>
-          ${bestDiscount > 0 ? `<div style="margin-bottom:10px"><span class="chip" style="color:var(--success);border-color:rgba(68,255,136,0.3)">🏷 ${bestDiscount}% de desconto</span></div>` : ''}
-
-          <div style="margin-bottom:14px;font-size:14px;color:var(--text2);line-height:1.6">${p.description}</div>
-
-          <div class="quantity-control">
-            <button class="qty-btn" onclick="changeQty(-1)">−</button>
-            <input class="qty-input" id="qty-input" type="number" value="1" min="1" max="${p.stock}">
-            <button class="qty-btn" onclick="changeQty(1)">+</button>
-            <span style="font-size:12px;color:var(--text3)">Estoque: ${p.stock}</span>
-          </div>
-
-          <div class="coupon-input-row">
-            <input class="form-control" id="coupon-input" placeholder="Código do cupom...">
-            <button class="btn btn-outline" onclick="applyCoupon('${p.id}','${p.sellerId}')">Aplicar</button>
-          </div>
-          <div id="coupon-result"></div>
-
-          <div style="display:flex;gap:10px;margin-bottom:10px;flex-wrap:wrap">
-            <button class="btn btn-primary" style="flex:1" onclick="addToCart('${p.id}')" ${p.stock === 0 ? 'disabled' : ''}>
-              🛒 Adicionar
-            </button>
-            <button class="btn btn-outline" onclick="toggleFav('${p.id}')">${isFav ? '❤' : '♡'}</button>
-          </div>
-          <button class="btn btn-outline btn-full" onclick="buyNow('${p.id}')" ${p.stock === 0 ? 'disabled' : ''} style="margin-bottom:8px">
-            ⚡ Comprar Agora
-          </button>
-
-          ${!isOwnProduct ? `
-          <a class="chat-seller-btn" href="https://wa.me/55${(seller.phone||'').replace(/\D/g,'')}" target="_blank" style="display:flex;align-items:center;justify-content:center;gap:8px;text-decoration:none;">
-            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
-            Falar com o vendedor no WhatsApp
-          </a>` : ''}
-
-          <div class="seller-card-mini" onclick="navigate('seller-profile',{id:'${seller.id}'})">
-            <img class="seller-avatar-mini" src="${seller.avatar || ''}" alt="${seller.username}" onerror="this.src='https://api.dicebear.com/7.x/initials/svg?seed=${seller.username}'">
-            <div>
-              <div style="font-size:13px;font-weight:600">${seller.username || 'Vendedor'}</div>
-              <div style="font-size:11px;color:var(--text3)">${seller.isAdmin ? '⭐ Vendedor Oficial' : 'Vendedor Verificado'}</div>
-            </div>
-            <div style="margin-left:auto;font-size:12px;color:var(--text3)">Ver loja →</div>
-          </div>
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-function switchImg(el, src) {
-  document.getElementById('main-img').src = src;
-  document.querySelectorAll('.product-thumb').forEach(t => t.classList.remove('active'));
-  el.classList.add('active');
-}
-
-function changeQty(delta) {
-  const input = document.getElementById('qty-input');
-  if (!input) return;
-  const max = parseInt(input.max) || 99;
-  let v = parseInt(input.value) + delta;
-  v = Math.max(1, Math.min(max, v));
-  input.value = v;
-}
-
-function applyCoupon(productId, sellerId) {
-  const code = document.getElementById('coupon-input')?.value?.trim().toUpperCase();
-  if (!code) return;
-  const coupons = DB.getCoupons();
-  const coupon = coupons.find(c => c.code === code && c.sellerId === sellerId && c.active);
-  const result = document.getElementById('coupon-result');
-  if (!coupon) { result.innerHTML = `<div class="payment-status failed" style="font-size:12px">Cupom inválido ou expirado</div>`; return; }
-  if (coupon.uses >= coupon.maxUses) { result.innerHTML = `<div class="payment-status failed" style="font-size:12px">Cupom esgotado</div>`; return; }
-  result.innerHTML = `<div class="payment-status confirmed" style="font-size:12px">✓ Cupom válido: ${coupon.discount}% de desconto!</div>`;
-  toast(`Cupom ${code} aplicado!`, 'success');
-  ssSet('applied_coupon', { code, discount: coupon.discount, sellerId, couponId: coupon.id });
-}
-
-// ─── MY CHATS PAGE ───────────────────────────────────────────
-function renderMyChats() {
-  if (!state.user) { showLogin(); return ''; }
-
-  const chats = DB.getChats();
-  const myRooms = Object.entries(chats).filter(([, room]) => room.participants?.includes(state.user.id));
-
-  if (myRooms.length === 0) {
-    return `
-      <div class="page-container" style="padding-top:28px;max-width:700px;margin:0 auto">
-        <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:20px">💬 CONVERSAS</h2>
-        <div class="empty-state">
-          <div class="icon">💬</div>
-          <h3>Nenhuma conversa ainda</h3>
-          <p>Acesse um produto e clique em "Falar com o vendedor"</p>
-        </div>
-      </div>
-    `;
-  }
-
-  const roomsHtml = myRooms.map(([roomId, room]) => {
-    const otherId = room.participants.find(id => id !== state.user.id);
-    const other = DB.getUsers().find(u => u.id === otherId);
-    if (!other) return '';
-    const msgs = room.messages || [];
-    const lastMsg = msgs.filter(m => m.senderId !== '__system__').at(-1);
-    const unread = msgs.filter(m => m.senderId !== state.user.id && m.senderId !== '__system__' && !m.read).length;
-
-    return `
-      <div class="chat-conv-item" onclick="openChat('${otherId}')">
-        <img class="chat-conv-avatar" src="${other.avatar || ''}" alt="${other.username}" onerror="this.src='https://api.dicebear.com/7.x/initials/svg?seed=${other.username}'">
-        <div class="chat-conv-info">
-          <div class="chat-conv-name">${other.username} ${other.isSeller ? '<span style="font-size:10px;color:var(--success)">✓</span>' : ''}</div>
-          <div class="chat-conv-last">${lastMsg ? (lastMsg.senderId === state.user.id ? 'Você: ' : '') + lastMsg.text : 'Inicie a conversa'}</div>
-        </div>
-        <div class="chat-conv-meta">
-          ${lastMsg ? `<div class="chat-conv-time">${timeAgo(lastMsg.time)}</div>` : ''}
-          ${unread > 0 ? `<div class="chat-conv-unread">${unread}</div>` : ''}
-        </div>
-      </div>
-    `;
-  }).join('');
-
-  return `
-    <div class="page-container" style="padding-top:28px;max-width:700px;margin:0 auto">
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:20px">💬 CONVERSAS</h2>
-      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius2);overflow:hidden">
-        ${roomsHtml}
-      </div>
-    </div>
-  `;
-}
-
-// ─── AUTH ─────────────────────────────────────────────────────
+// ===== AUTH =====
 function showLogin() {
-  modal(`
-    <div class="modal">
-      <button class="modal-close" onclick="closeModal()">×</button>
-      <h2>ENTRAR</h2>
-      <div class="form-group">
-        <label>Usuário</label>
-        <input class="form-control" id="login-user" placeholder="Seu usuário" autocomplete="username">
-      </div>
-      <div class="form-group">
-        <label>Senha</label>
-        <input class="form-control" id="login-pass" type="password" placeholder="Sua senha" autocomplete="current-password">
-      </div>
-      <button class="btn btn-primary btn-full" onclick="doLogin()">Entrar</button>
-      <div style="text-align:center;margin-top:14px">
-        <span class="text-link" onclick="closeModal();showRegister()">Não tem conta? Cadastre-se</span>
-      </div>
-    </div>
-  `);
-  setTimeout(() => document.getElementById('login-user')?.focus(), 300);
+  closeDropdown();
+  var h = '<h2>ENTRAR</h2>';
+  h += '<div class="form-group"><label>Nome de usuário</label><input class="form-control" id="login-user" placeholder="Seu nome"></div>';
+  h += '<button class="btn btn-primary btn-full" onclick="doLogin()">Entrar</button>';
+  h += '<div class="divider"></div>';
+  h += '<p style="text-align:center;color:var(--text3);font-size:13px">Não tem conta? <span class="text-link" onclick="closeModal();showRegister()">Criar conta</span></p>';
+  openModal(h);
 }
-
 function showRegister() {
-  modal(`
-    <div class="modal">
-      <button class="modal-close" onclick="closeModal()">×</button>
-      <h2>CADASTRAR</h2>
-      <div class="form-group">
-        <label>Usuário *</label>
-        <input class="form-control" id="reg-user" placeholder="Escolha um usuário" autocomplete="username">
-      </div>
-      <div class="form-group">
-        <label>E-mail *</label>
-        <input class="form-control" id="reg-email" type="email" placeholder="seu@email.com" autocomplete="email">
-      </div>
-      <div class="form-group">
-        <label>Telefone</label>
-        <input class="form-control" id="reg-phone" placeholder="(11) 99999-9999" type="tel">
-      </div>
-      <div class="form-group">
-        <label>Senha *</label>
-        <input class="form-control" id="reg-pass" type="password" placeholder="Mínimo 6 caracteres" autocomplete="new-password">
-      </div>
-      <button class="btn btn-primary btn-full" onclick="doRegister()">Criar conta</button>
-      <div style="text-align:center;margin-top:14px">
-        <span class="text-link" onclick="closeModal();showLogin()">Já tem conta? Entrar</span>
-      </div>
-    </div>
-  `);
+  closeDropdown();
+  var h = '<h2>CRIAR CONTA</h2>';
+  h += '<div class="form-group"><label>Nome de usuário *</label><input class="form-control" id="reg-user" placeholder="Escolha um nome"></div>';
+  h += '<div class="form-group"><label>Email</label><input class="form-control" id="reg-email" type="email" placeholder="seu@email.com"></div>';
+  h += '<div class="form-group"><label>Telefone</label><input class="form-control" id="reg-phone" placeholder="11999999999"></div>';
+  h += '<button class="btn btn-primary btn-full" onclick="doRegister()">Criar conta</button>';
+  h += '<div class="divider"></div>';
+  h += '<p style="text-align:center;color:var(--text3);font-size:13px">Já tem conta? <span class="text-link" onclick="closeModal();showLogin()">Entrar</span></p>';
+  openModal(h);
 }
-
 function doLogin() {
-  const user = document.getElementById('login-user')?.value?.trim();
-  const pass = document.getElementById('login-pass')?.value;
-  if (!user || !pass) { toast('Preencha todos os campos', 'error'); return; }
-  // Always read fresh from users array (not from rm_current which may be stale)
-  const u = DB.getUsers().find(u => u.username === user && u.password === pass);
-  if (!u) { toast('Usuário ou senha incorretos', 'error'); return; }
-  state.user = u;
-  DB.setCurrent(u); // update rm_current with latest data
-  closeModal();
-  toast(`Bem-vindo, ${u.username}!`, 'success');
-
-  // Auth with server — server will send back authoritative user data (isSeller may have changed)
-  WS.auth(u.id);
-  // Sync user data to server
-  WS.send({ type: 'user_sync', user: u });
-  render();
+  var username = document.getElementById('login-user').value.trim();
+  if (!username) { toast('Digite seu nome', 'error'); return; }
+  api('POST', '/login', { username: username }).then(function(data) {
+    if (data.success) { setUser(data.user); closeModal(); toast('Bem-vindo!', 'success'); render(); }
+    else toast(data.error || 'Erro', 'error');
+  }).catch(function() { toast('Erro de conexão', 'error'); });
 }
-
 function doRegister() {
-  const username = document.getElementById('reg-user')?.value?.trim();
-  const email = document.getElementById('reg-email')?.value?.trim();
-  const phone = document.getElementById('reg-phone')?.value?.trim();
-  const password = document.getElementById('reg-pass')?.value;
-  if (!username || !email || !password) { toast('Preencha os campos obrigatórios', 'error'); return; }
-  if (password.length < 6) { toast('Senha deve ter ao menos 6 caracteres', 'error'); return; }
-  const users = DB.getUsers();
-  if (users.find(u => u.username === username)) { toast('Usuário já existe', 'error'); return; }
-  if (users.find(u => u.email === email)) { toast('E-mail já cadastrado', 'error'); return; }
-  const newUser = {
-    id: uid(), username, email, phone, password,
-    avatar: `https://api.dicebear.com/7.x/initials/svg?seed=${username}&backgroundColor=111111&textColor=ffffff`,
-    isSeller: false, isAdmin: false, createdAt: new Date().toISOString(), bio: '',
-    pixKey: '', pixKeyType: 'email',
-  };
-  users.push(newUser);
-  DB.setUsers(users);
-  state.user = newUser;
-  DB.setCurrent(newUser);
-  closeModal();
-  toast(`Conta criada! Bem-vindo, ${username}!`, 'success');
-
-  // Auth with WebSocket server and sync new user
-  WS.auth(newUser.id);
-  WS.send({ type: 'user_sync', user: newUser });
-  render();
+  var username = document.getElementById('reg-user').value.trim();
+  var email = document.getElementById('reg-email').value.trim();
+  var phone = document.getElementById('reg-phone').value.trim();
+  if (!username) { toast('Digite um nome', 'error'); return; }
+  var user = { id: uid(), username: username, email: email, phone: phone, avatar: 'https://api.dicebear.com/7.x/initials/svg?seed=' + encodeURIComponent(username), pixKey: null, isSeller: 0, isAdmin: 0 };
+  api('POST', '/register', user).then(function(data) {
+    if (data.success) { setUser(data.user); closeModal(); toast('Conta criada!', 'success'); render(); }
+    else toast(data.error || 'Erro', 'error');
+  }).catch(function() { toast('Erro de conexão', 'error'); });
 }
-
-function doLogout() {
+function setUser(user) {
+  state.user = user;
+  localStorage.setItem('astore_user', JSON.stringify(user));
+  updateBtn();
+  wsSend({ type: 'auth', userId: user.id });
+}
+function logout() {
   state.user = null;
-  DB.setCurrent(null);
-  closeChatPanel();
+  localStorage.removeItem('astore_user');
+  updateBtn();
+  closeDropdown();
+  go('home');
   toast('Até logo!', 'info');
-  navigate('home');
+}
+function updateBtn() {
+  var btn = document.getElementById('user-btn');
+  if (state.user) btn.innerHTML = '<img src="' + state.user.avatar + '">';
+  else btn.innerHTML = '&#128100;';
 }
 
-// ─── PROFILE ─────────────────────────────────────────────────
-function renderProfile() {
-  if (!state.user) { showLogin(); return '<div class="page-container"><div class="spinner"></div></div>'; }
-  const u = state.user;
-  const orders = DB.getOrders().filter(o => o.buyerId === u.id);
-  const favs = DB.getFavs().filter(f => f.userId === u.id);
-  const cart = DB.getCart().filter(c => c.userId === u.id);
+// ===== MODAL =====
+function openModal(content) {
+  document.getElementById('modal-wrap').innerHTML = '<div class="modal-overlay" onclick="if(event.target===this)closeModal()"><div class="modal"><button class="modal-close" onclick="closeModal()">✕</button>' + content + '</div></div>';
+}
+function closeModal() { document.getElementById('modal-wrap').innerHTML = ''; }
 
-  return `
-    <div class="profile-header">
-      <div class="profile-header-inner">
-        <div class="profile-top">
-          <div class="profile-avatar-wrap">
-            <img class="profile-avatar" id="profile-avatar-img" src="${u.avatar}" alt="${u.username}" onerror="this.src='https://api.dicebear.com/7.x/initials/svg?seed=${u.username}'">
-            <label class="profile-avatar-upload" title="Trocar foto">
-              ✏
-              <input type="file" accept="image/*" onchange="uploadAvatar(event)">
-            </label>
-          </div>
-          <div class="profile-info">
-            <h2>${u.username}</h2>
-            ${u.isAdmin ? '<div class="seller-badge">⭐ Admin Oficial</div>' : u.isSeller ? '<div class="seller-badge">✓ Vendedor</div>' : ''}
-            <div class="profile-stats">
-              <div class="profile-stat"><strong>${orders.length}</strong>pedidos</div>
-              <div class="profile-stat"><strong>${favs.length}</strong>favoritos</div>
-              <div class="profile-stat"><strong>${cart.length}</strong>carrinho</div>
-            </div>
-          </div>
-          <button class="btn btn-outline btn-sm" style="margin-left:auto;align-self:flex-start" onclick="doLogout()">Sair</button>
-        </div>
-        <div class="profile-tabs">
-          <div class="profile-tab active" onclick="switchProfileTab(this,'tab-info')">Dados</div>
-          <div class="profile-tab" onclick="switchProfileTab(this,'tab-orders')">Pedidos</div>
-          <div class="profile-tab" onclick="switchProfileTab(this,'tab-cart')">Carrinho</div>
-          <div class="profile-tab" onclick="switchProfileTab(this,'tab-favs')">Favoritos</div>
-          ${u.isAdmin ? `<div class="profile-tab" onclick="navigate('admin-users')">Admin</div>` : ''}
-          ${u.isSeller ? `<div class="profile-tab" onclick="navigate('seller-dashboard')">Vendedor</div>` : ''}
-        </div>
-      </div>
-    </div>
-    <div class="page-container" style="max-width:1000px;margin:0 auto">
-      <div id="tab-info">
-        <div style="max-width:480px;margin-top:20px">
-          <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin-bottom:14px">EDITAR PERFIL</h3>
-          <div class="form-group"><label>Bio</label><textarea class="form-control" id="edit-bio" placeholder="Fale sobre você...">${u.bio || ''}</textarea></div>
-          <div class="form-group"><label>E-mail</label><input class="form-control" id="edit-email" value="${u.email || ''}" type="email"></div>
-          <div class="form-group"><label>Telefone</label><input class="form-control" id="edit-phone" value="${u.phone || ''}" type="tel"></div>
-          <button class="btn btn-primary" onclick="saveProfile()">Salvar alterações</button>
-
-          ${u.isSeller ? `
-          <div class="divider"></div>
-          <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin-bottom:14px">MINHA CHAVE PIX</h3>
-          <div class="pix-setup-card">
-            <div class="form-group">
-              <label>Tipo de chave PIX</label>
-              <select class="form-control" id="pix-type">
-                <option value="email" ${u.pixKeyType === 'email' ? 'selected' : ''}>E-mail</option>
-                <option value="cpf" ${u.pixKeyType === 'cpf' ? 'selected' : ''}>CPF</option>
-                <option value="cnpj" ${u.pixKeyType === 'cnpj' ? 'selected' : ''}>CNPJ</option>
-                <option value="telefone" ${u.pixKeyType === 'telefone' ? 'selected' : ''}>Telefone</option>
-                <option value="aleatoria" ${u.pixKeyType === 'aleatoria' ? 'selected' : ''}>Chave Aleatória</option>
-              </select>
-            </div>
-            <div class="form-group">
-              <label>Chave PIX *</label>
-              <input class="form-control" id="pix-key" value="${u.pixKey || ''}" placeholder="Ex: seu@email.com, 000.000.000-00...">
-            </div>
-            ${u.pixKey ? `
-              <div style="background:rgba(68,255,136,0.07);border:1px solid rgba(68,255,136,0.2);border-radius:var(--radius);padding:12px;margin-bottom:14px;font-size:12px">
-                <div style="color:var(--success);font-weight:600;margin-bottom:4px">✓ Chave PIX cadastrada</div>
-                <div style="color:var(--text2);font-family:'Space Mono',monospace">${u.pixKey}</div>
-                <div style="color:var(--text3);margin-top:2px">Tipo: ${u.pixKeyType}</div>
-              </div>
-            ` : `
-              <div style="background:rgba(255,204,0,0.07);border:1px solid rgba(255,204,0,0.2);border-radius:var(--radius);padding:12px;margin-bottom:14px;font-size:12px;color:var(--warning)">
-                ⚠ Nenhuma chave PIX cadastrada. Seus clientes não poderão pagar via PIX.
-              </div>
-            `}
-            <button class="btn btn-primary" onclick="savePixKey()">💾 Salvar chave PIX</button>
-          </div>
-          ` : ''}
-        </div>
-      </div>
-      <div id="tab-orders" style="display:none">
-        <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin:20px 0 14px">MEUS PEDIDOS</h3>
-        ${orders.length === 0 ? `<div class="empty-state"><div class="icon">📦</div><h3>Nenhum pedido ainda</h3></div>` :
-          [...orders].reverse().map(o => renderOrderCard(o)).join('')}
-      </div>
-      <div id="tab-cart" style="display:none">
-        <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin:20px 0 14px">MEU CARRINHO</h3>
-        ${renderCartContent()}
-      </div>
-      <div id="tab-favs" style="display:none">
-        <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin:20px 0 14px">FAVORITOS</h3>
-        ${renderFavsContent()}
-      </div>
-    </div>
-  `;
+// ===== RENDER =====
+function render() {
+  var main = document.getElementById('main');
+  var p = state.page;
+  if (p === 'home') renderHome(main);
+  else if (p === 'product') renderProduct(main);
+  else if (p === 'profile') renderProfile(main);
+  else if (p === 'orders') renderOrders(main);
+  else if (p === 'tracking') renderTracking(main);
+  else if (p === 'seller-dashboard') renderDash(main);
+  else if (p === 'seller-products') renderMyProducts(main);
+  else if (p === 'add-product') renderAddProduct(main);
+  else if (p === 'edit-product') renderEditProduct(main);
+  else if (p === 'seller-coupons') renderCoupons(main);
+  else if (p === 'seller-pix') renderPix(main);
+  else if (p === 'admin-users') renderUsers(main);
+  else if (p === 'chat') renderChat(main);
+  else if (p === 'notifications') renderNotifs(main);
+  else renderHome(main);
 }
 
-function switchProfileTab(el, tabId) {
-  document.querySelectorAll('.profile-tab').forEach(t => t.classList.remove('active'));
-  el.classList.add('active');
-  document.querySelectorAll('[id^="tab-"]').forEach(t => t.style.display = 'none');
-  const tab = document.getElementById(tabId);
-  if (tab) tab.style.display = 'block';
-}
-
-function renderOrderCard(o) {
-  const p = DB.getProducts().find(pr => pr.id === o.productId);
-  const statusLabels = {
-    pending_payment: { label: 'Aguardando', color: 'var(--warning)' },
-    paid: { label: 'Pago', color: 'var(--success)' },
-    processing: { label: 'Processando', color: 'var(--text2)' },
-    shipped: { label: 'Enviado', color: '#4488ff' },
-    delivered: { label: 'Entregue', color: 'var(--success)' },
-    cancelled: { label: 'Cancelado', color: 'var(--danger)' },
-  };
-  const st = statusLabels[o.status] || { label: o.status, color: 'var(--text2)' };
-  return `
-    <div class="cart-item" style="cursor:pointer" onclick="navigate('tracking',{id:'${o.id}'})">
-      <img class="cart-item-img" src="${p?.images[0] || ''}" alt="" onerror="this.src='https://via.placeholder.com/80x80/111/444?text=?'">
-      <div class="cart-item-info">
-        <div class="cart-item-title">${p?.title || 'Produto'}</div>
-        <div style="font-size:11px;color:var(--text3)">${timeAgo(o.createdAt)} • Qtd: ${o.quantity}</div>
-        <div class="cart-item-price" style="margin-top:4px">${fmt(o.total)}</div>
-      </div>
-      <div style="text-align:right;flex-shrink:0">
-        <div style="font-size:12px;font-weight:700;color:${st.color}">${st.label}</div>
-        <div style="font-size:11px;color:var(--text3);margin-top:4px">→ Rastrear</div>
-      </div>
-    </div>
-  `;
-}
-
-async function uploadAvatar(event) {
-  const file = event.target.files[0];
-  if (!file) return;
-  const avatarImg = document.getElementById('profile-avatar-img');
-  if (avatarImg) { avatarImg.style.opacity = '0.5'; }
-  toast('⏳ Enviando foto...', 'info');
-
-  try {
-    const url = await uploadImageToServer(file);
-    const users = DB.getUsers();
-    const idx = users.findIndex(u => u.id === state.user.id);
-    if (idx >= 0) {
-      users[idx].avatar = url;
-      DB.setUsers(users);
-      state.user = users[idx];
-      DB.setCurrent(state.user);
-      if (avatarImg) { avatarImg.src = url; avatarImg.style.opacity = '1'; }
-      // Sync with server so avatar is visible to other users
-      WS.send({ type: 'user_sync', user: state.user });
-      renderNav();
-      toast('✅ Foto de perfil atualizada!', 'success');
+// ===== HOME =====
+function renderHome(el) {
+  api('GET', '/products').then(function(data) {
+    var products = data.products || [];
+    var cats = ['todos','moda','eletronicos','acessorios','bolsas','beleza','casa','esporte'];
+    var active = state.params.category || 'todos';
+    var filtered = active === 'todos' ? products : products.filter(function(p) { return p.category === active; });
+    var h = '<div class="hero"><h1>REDZIN<span>MARKET</span></h1><p>O marketplace black & white</p></div>';
+    h += '<div class="categories">';
+    for (var i = 0; i < cats.length; i++) {
+      var c = cats[i];
+      h += '<button class="cat-chip ' + (active === c ? 'active' : '') + '" onclick="go(\'home\',{category:\'' + c + '\'})">' + (c === 'todos' ? 'Todos' : c.charAt(0).toUpperCase() + c.slice(1)) + '</button>';
     }
-  } catch(err) {
-    if (avatarImg) { avatarImg.style.opacity = '1'; }
-    toast('Erro ao enviar foto', 'error');
-  }
+    h += '</div><div class="container"><h2 class="section-title">' + filtered.length + ' PRODUTOS</h2><div class="grid">';
+    if (filtered.length === 0) {
+      h += '<div class="empty" style="grid-column:1/-1"><div class="empty-icon">📦</div><h3>Nenhum produto ainda</h3></div>';
+    } else {
+      for (var j = 0; j < filtered.length; j++) {
+        var p = filtered[j];
+        var off = (p.originalPrice && p.price < p.originalPrice) ? '<span class="badge-off">-' + Math.round((1 - p.price / p.originalPrice) * 100) + '%</span>' : '';
+        h += '<div class="card" onclick="go(\'product\',{id:\'' + p.id + '\'})">' + off;
+        h += '<img src="' + (p.images[0] || 'https://placehold.co/200x200/111/444?text=Produto') + '" onerror="this.src=\'https://placehold.co/200x200/111/444?text=?\'">';
+        h += '<div class="card-info"><div class="card-title">' + p.title + '</div>';
+        h += '<div class="card-price">' + fmt(p.price) + (p.originalPrice ? '<span class="old">' + fmt(p.originalPrice) + '</span>' : '') + '</div>';
+        h += '<div class="card-sold">' + (p.sold || 0) + ' vendidos</div></div></div>';
+      }
+    }
+    h += '</div></div>';
+    el.innerHTML = h;
+  });
 }
 
+// ===== PRODUCT =====
+function renderProduct(el) {
+  Promise.all([api('GET', '/products'), api('GET', '/users')]).then(function(r) {
+    var products = r[0].products || [];
+    var users = r[1].users || [];
+    var p = products.find(function(x) { return x.id === state.params.id; });
+    if (!p) { el.innerHTML = '<div class="container"><h2>Produto não encontrado</h2></div>'; return; }
+    var seller = users.find(function(u) { return u.id === p.sellerId; });
+    var h = '<div class="container" style="padding-top:20px;max-width:900px;margin:0 auto">';
+    h += '<button class="btn btn-outline btn-sm" style="margin-bottom:16px" onclick="go(\'home\')">← Voltar</button>';
+    h += '<div class="detail"><div>';
+    h += '<img class="detail-img" id="main-img" src="' + (p.images[0] || 'https://placehold.co/400x400/111/444?text=Produto') + '">';
+    if (p.images.length > 1) {
+      h += '<div class="detail-thumbs">';
+      for (var i = 0; i < p.images.length; i++) {
+        h += '<img class="detail-thumb ' + (i === 0 ? 'active' : '') + '" src="' + p.images[i] + '" onclick="changeImg(this,\'' + p.images[i] + '\')">';
+      }
+      h += '</div>';
+    }
+    h += '</div><div class="detail-info">';
+    h += '<h1>' + p.title + '</h1>';
+    h += '<div class="price-big">' + fmt(p.price) + (p.originalPrice ? '<span class="old">' + fmt(p.originalPrice) + '</span>' : '') + '</div>';
+    h += '<div class="meta"><span>📦 ' + p.stock + ' em estoque</span><span>🛒 ' + (p.sold || 0) + ' vendidos</span><span>🏷 ' + p.category + '</span></div>';
+    h += '<div style="margin-bottom:16px"><p style="color:var(--text2);font-size:14px;line-height:1.6">' + (p.description || 'Sem descrição') + '</p></div>';
+    h += '<div class="qty-row"><span style="font-size:13px;color:var(--text2)">Qtd:</span><button class="qty-btn" onclick="chgQty(-1)">−</button><input class="qty-input" id="qty" value="1" readonly><button class="qty-btn" onclick="chgQty(1)">+</button></div>';
+    h += '<button class="btn btn-primary btn-full" onclick="addCart(\'' + p.id + '\')">Adicionar ao carrinho</button>';
+    h += '<button class="chat-btn" onclick="openChatWith(\'' + p.sellerId + '\',\'' + p.title.replace(/'/g, '') + '\')">💬 Falar com vendedor</button>';
+    if (seller) {
+      h += '<div class="seller-mini"><img src="' + seller.avatar + '"><div><div style="font-size:13px;font-weight:600">' + seller.username + '</div><div style="font-size:11px;color:var(--text3)">Vendedor</div></div></div>';
+    }
+    h += '</div></div></div>';
+    el.innerHTML = h;
+  });
+}
+function changeImg(thumb, src) {
+  document.getElementById('main-img').src = src;
+  var all = document.querySelectorAll('.detail-thumb');
+  for (var i = 0; i < all.length; i++) all[i].classList.remove('active');
+  thumb.classList.add('active');
+}
+function chgQty(d) { var i = document.getElementById('qty'); var v = parseInt(i.value) + d; if (v < 1) v = 1; i.value = v; }
+function addCart(pid) {
+  if (!state.user) { showLogin(); return; }
+  toast('Produto adicionado!', 'success');
+}
+function openChatWith(userId, ctx) {
+  if (!state.user) { showLogin(); return; }
+  wsSend({ type: 'chat_open', userId: state.user.id, otherUserId: userId, productContext: ctx });
+  go('chat');
+}
+
+// ===== PROFILE =====
+function renderProfile(el) {
+  if (!state.user) { showLogin(); return; }
+  var u = state.user;
+  var h = '<div class="container" style="padding-top:20px;max-width:600px;margin:0 auto">';
+  h += '<h2 class="section-title">MEU PERFIL</h2>';
+  h += '<div style="display:flex;align-items:center;gap:16px;margin-bottom:24px">';
+  h += '<img src="' + u.avatar + '" style="width:72px;height:72px;border-radius:50%;border:3px solid var(--border2)">';
+  h += '<div><h3 style="font-size:20px;font-weight:700">' + u.username + '</h3>';
+  if (u.isSeller) h += '<span class="role-badge seller">Vendedor</span> ';
+  if (u.isAdmin) h += '<span class="role-badge admin">Admin</span>';
+  h += '</div></div>';
+  h += '<div class="form-group"><label>Email</label><input class="form-control" id="p-email" value="' + (u.email || '') + '"></div>';
+  h += '<div class="form-group"><label>Telefone</label><input class="form-control" id="p-phone" value="' + (u.phone || '') + '"></div>';
+  h += '<div class="form-group"><label>Chave PIX</label><input class="form-control" id="p-pix" value="' + (u.pixKey || '') + '" placeholder="CPF, email, telefone..."></div>';
+  h += '<button class="btn btn-primary btn-full" onclick="saveProfile()">Salvar</button>';
+  if (u.isSeller) h += '<button class="btn btn-outline btn-full" style="margin-top:10px" onclick="go(\'seller-dashboard\')">Painel Vendedor</button>';
+  if (u.isAdmin) h += '<button class="btn btn-outline btn-full" style="margin-top:10px" onclick="go(\'admin-users\')">Gerenciar Usuários</button>';
+  h += '<button class="btn btn-outline btn-full" style="margin-top:10px;color:var(--danger);border-color:var(--danger)" onclick="logout()">Sair</button>';
+  h += '</div>';
+  el.innerHTML = h;
+}
 function saveProfile() {
-  const bio = document.getElementById('edit-bio')?.value || '';
-  const email = document.getElementById('edit-email')?.value || '';
-  const phone = document.getElementById('edit-phone')?.value || '';
-  const users = DB.getUsers();
-  const idx = users.findIndex(u => u.id === state.user.id);
-  if (idx >= 0) {
-    users[idx] = { ...users[idx], bio, email, phone };
-    DB.setUsers(users);
-    state.user = users[idx];
-    DB.setCurrent(state.user);
-    toast('Perfil salvo!', 'success');
-  }
+  api('POST', '/update-user', { userId: state.user.id, email: document.getElementById('p-email').value.trim(), phone: document.getElementById('p-phone').value.trim(), avatar: state.user.avatar, pixKey: document.getElementById('p-pix').value.trim() })
+    .then(function(d) { if (d.success) { setUser(d.user); toast('Salvo!', 'success'); render(); } else toast('Erro', 'error'); });
 }
 
-// ─── SELLER PIX ──────────────────────────────────────────────
-function savePixKey() {
-  const pixKey = document.getElementById('pix-key')?.value?.trim();
-  const pixKeyType = document.getElementById('pix-type')?.value;
-  if (!pixKey) { toast('Informe a chave PIX', 'error'); return; }
-
-  const users = DB.getUsers();
-  const idx = users.findIndex(u => u.id === state.user.id);
-  if (idx >= 0) {
-    users[idx].pixKey = pixKey;
-    users[idx].pixKeyType = pixKeyType;
-    DB.setUsers(users);
-    state.user = users[idx];
-    DB.setCurrent(state.user);
-    toast('Chave PIX salva!', 'success');
-    render();
-  }
-}
-
-function renderSellerPix() {
-  if (!state.user?.isSeller) { navigate('home'); return ''; }
-  const u = state.user;
-  return `
-    <div class="page-container" style="padding-top:24px;max-width:560px;margin:0 auto">
-      <button class="btn btn-outline btn-sm" style="margin-bottom:20px" onclick="history.back()">← Voltar</button>
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:6px">CHAVE PIX</h2>
-      <p style="color:var(--text3);margin-bottom:24px;font-size:13px">Configure sua chave PIX para receber pagamentos</p>
-
-      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius2);padding:24px">
-        <div class="form-group">
-          <label>Tipo de Chave *</label>
-          <select class="form-control" id="pix-type">
-            <option value="email" ${u.pixKeyType === 'email' ? 'selected' : ''}>📧 E-mail</option>
-            <option value="cpf" ${u.pixKeyType === 'cpf' ? 'selected' : ''}>🪪 CPF</option>
-            <option value="cnpj" ${u.pixKeyType === 'cnpj' ? 'selected' : ''}>🏢 CNPJ</option>
-            <option value="telefone" ${u.pixKeyType === 'telefone' ? 'selected' : ''}>📱 Telefone</option>
-            <option value="aleatoria" ${u.pixKeyType === 'aleatoria' ? 'selected' : ''}>🔀 Chave Aleatória</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label>Chave PIX *</label>
-          <input class="form-control" id="pix-key" value="${u.pixKey || ''}" placeholder="Ex: seu@email.com, 000.000.000-00...">
-        </div>
-
-        ${u.pixKey ? `
-          <div style="background:rgba(68,255,136,0.07);border:1px solid rgba(68,255,136,0.2);border-radius:var(--radius);padding:14px;margin-bottom:16px">
-            <div style="font-size:11px;font-weight:600;color:var(--success);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">✓ Chave PIX Cadastrada</div>
-            <div style="font-family:'Space Mono',monospace;font-size:13px;word-break:break-all">${u.pixKey}</div>
-            <div style="font-size:11px;color:var(--text3);margin-top:4px">Tipo: ${u.pixKeyType}</div>
-          </div>
-        ` : `
-          <div style="background:rgba(255,204,0,0.07);border:1px solid rgba(255,204,0,0.2);border-radius:var(--radius);padding:14px;margin-bottom:16px">
-            <div style="font-size:12px;color:var(--warning)">⚠ Nenhuma chave PIX cadastrada. Configure agora para receber pagamentos dos seus clientes.</div>
-          </div>
-        `}
-
-        <button class="btn btn-primary btn-full" onclick="savePixKey()">💾 Salvar Chave PIX</button>
-      </div>
-
-      <div style="margin-top:16px;padding:16px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius2)">
-        <h3 style="font-family:'Bebas Neue',sans-serif;font-size:16px;letter-spacing:2px;margin-bottom:10px;color:var(--text2)">COMO FUNCIONA</h3>
-        <div style="font-size:12px;color:var(--text3);line-height:1.8">
-          <p>• Quando um cliente finalizar uma compra, sua chave PIX será exibida para pagamento</p>
-          <p>• O QR Code será gerado automaticamente com sua chave</p>
-          <p>• Mantenha sua chave atualizada para não perder vendas</p>
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-// ─── SELLER PROFILE (public) ──────────────────────────────────
-function renderSellerProfile() {
-  const seller = DB.getUsers().find(u => u.id === state.params.id);
-  if (!seller) return `<div class="page-container"><div class="empty-state"><div class="icon">😕</div><h3>Vendedor não encontrado</h3></div></div>`;
-  const products = DB.getProducts().filter(p => p.sellerId === seller.id);
-  const favs = state.user ? DB.getFavs().filter(f => f.userId === state.user.id).map(f => f.productId) : [];
-  const coupons = DB.getCoupons();
-  const isOwnProfile = state.user?.id === seller.id;
-
-  return `
-    <div class="profile-header">
-      <div class="profile-header-inner">
-        <div class="profile-top">
-          <img class="profile-avatar" src="${seller.avatar}" alt="${seller.username}" onerror="this.src='https://api.dicebear.com/7.x/initials/svg?seed=${seller.username}'">
-          <div class="profile-info">
-            <h2>${seller.username}</h2>
-            ${seller.isAdmin ? '<div class="seller-badge">⭐ Vendedor Oficial</div>' : seller.isSeller ? '<div class="seller-badge">✓ Vendedor</div>' : ''}
-            <div style="font-size:12px;color:var(--text2);margin-top:6px">${seller.bio || ''}</div>
-            <div class="profile-stats">
-              <div class="profile-stat"><strong>${products.length}</strong>produtos</div>
-              <div class="profile-stat"><strong>${products.reduce((a,p) => a + (p.sold||0), 0)}</strong>vendidos</div>
-            </div>
-          </div>
-          ${!isOwnProfile ? `
-          <a class="btn btn-outline btn-sm" style="margin-left:auto;align-self:flex-start;gap:6px;display:flex;align-items:center;text-decoration:none;" href="https://wa.me/55${(seller.phone||'').replace(/\D/g,'')}" target="_blank">
-            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
-            WhatsApp
-          </a>` : ''}
-        </div>
-        <div class="profile-tabs">
-          <div class="profile-tab active">Produtos</div>
-        </div>
-      </div>
-    </div>
-    <div class="page-container">
-      ${products.length === 0 ?
-        `<div class="empty-state"><div class="icon">📦</div><h3>Nenhum produto ainda</h3></div>` :
-        `<div class="product-grid">${products.map(p => renderProductCard(p, favs, coupons)).join('')}</div>`
-      }
-    </div>
-  `;
-}
-
-// ─── CART ────────────────────────────────────────────────────
-function renderCart() {
-  if (!state.user) { showLogin(); return ''; }
-  const cartItems = DB.getCart().filter(c => c.userId === state.user.id);
-  const products = DB.getProducts();
-  let total = 0;
-
-  const itemsHtml = cartItems.length === 0 ? `<div class="empty-state"><div class="icon">🛒</div><h3>Carrinho vazio</h3><p>Adicione produtos!</p></div>` :
-    cartItems.map(item => {
-      const p = products.find(pr => pr.id === item.productId);
-      if (!p) return '';
-      const subtotal = p.price * item.quantity;
-      total += subtotal;
-      return `
-        <div class="cart-item">
-          <img class="cart-item-img" src="${p.images[0]}" alt="${p.title}" onclick="navigate('product',{id:'${p.id}'})" style="cursor:pointer" onerror="this.src='https://via.placeholder.com/80x80/111/444?text=?'">
-          <div class="cart-item-info">
-            <div class="cart-item-title">${p.title}</div>
-            <div style="font-size:11px;color:var(--text3)">${fmt(p.price)} un.</div>
-            <div style="display:flex;align-items:center;gap:10px;margin-top:6px">
-              <button class="qty-btn" onclick="updateCartQty('${item.productId}',-1)" style="width:32px;height:32px;font-size:16px">−</button>
-              <span style="font-family:'Space Mono',monospace;font-size:14px">${item.quantity}</span>
-              <button class="qty-btn" onclick="updateCartQty('${item.productId}',1)" style="width:32px;height:32px;font-size:16px">+</button>
-            </div>
-          </div>
-          <div style="text-align:right;flex-shrink:0">
-            <div class="cart-item-price">${fmt(subtotal)}</div>
-            <button class="btn btn-outline btn-sm" style="margin-top:6px;border-color:var(--danger);color:var(--danger)" onclick="removeFromCart('${item.productId}')">×</button>
-          </div>
-        </div>
-      `;
-    }).join('');
-
-  return `
-    <div class="page-container" style="padding-top:24px">
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:20px">🛒 CARRINHO</h2>
-      <div class="checkout-layout">
-        <div>${itemsHtml}</div>
-        ${cartItems.length > 0 ? `
-        <div class="cart-summary">
-          <h3>RESUMO</h3>
-          <div class="summary-row"><span>Subtotal</span><span>${fmt(total)}</span></div>
-          <div class="summary-row"><span>Frete</span><span>A calcular</span></div>
-          <div class="summary-row total"><span>Total</span><span>${fmt(total)}</span></div>
-          <button class="btn btn-primary btn-full" style="margin-top:14px" onclick="checkoutCart()">Finalizar compra →</button>
-        </div>` : ''}
-      </div>
-    </div>
-  `;
-}
-
-function renderCartContent() {
-  if (!state.user) return '';
-  const cartItems = DB.getCart().filter(c => c.userId === state.user.id);
-  if (cartItems.length === 0) return `<div class="empty-state" style="padding:40px"><div class="icon">🛒</div><h3>Carrinho vazio</h3></div>`;
-  return cartItems.map(item => {
-    const p = DB.getProducts().find(pr => pr.id === item.productId);
-    if (!p) return '';
-    return `
-      <div class="cart-item" style="cursor:pointer" onclick="navigate('product',{id:'${p.id}'})">
-        <img class="cart-item-img" src="${p.images[0]}" alt="${p.title}" onerror="this.src='https://via.placeholder.com/80x80/111/444?text=?'">
-        <div class="cart-item-info">
-          <div class="cart-item-title">${p.title}</div>
-          <div class="cart-item-price">${fmt(p.price)} × ${item.quantity}</div>
-        </div>
-        <button class="btn btn-outline btn-sm" style="border-color:var(--danger);color:var(--danger)" onclick="event.stopPropagation();removeFromCart('${item.productId}');render()">×</button>
-      </div>
-    `;
-  }).join('');
-}
-
-function renderFavsContent() {
-  if (!state.user) return '';
-  const favs = DB.getFavs().filter(f => f.userId === state.user.id);
-  if (favs.length === 0) return `<div class="empty-state" style="padding:40px"><div class="icon">❤</div><h3>Nenhum favorito</h3></div>`;
-  const favProds = favs.map(f => DB.getProducts().find(p => p.id === f.productId)).filter(Boolean);
-  return `<div class="product-grid">${favProds.map(p => renderProductCard(p, favs.map(f => f.productId), DB.getCoupons())).join('')}</div>`;
-}
-
-function renderFavorites() {
-  if (!state.user) { showLogin(); return ''; }
-  const favs = DB.getFavs().filter(f => f.userId === state.user.id);
-  const favProds = favs.map(f => DB.getProducts().find(p => p.id === f.productId)).filter(Boolean);
-  return `
-    <div class="page-container" style="padding-top:24px">
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:20px">❤ FAVORITOS</h2>
-      ${favProds.length === 0 ? `<div class="empty-state"><div class="icon">❤</div><h3>Nenhum favorito ainda</h3></div>` :
-        `<div class="product-grid">${favProds.map(p => renderProductCard(p, favs.map(f => f.productId), DB.getCoupons())).join('')}</div>`}
-    </div>
-  `;
-}
-
-// ─── CART ACTIONS ─────────────────────────────────────────────
-function addToCart(productId) {
-  if (!state.user) { showLogin(); return; }
-  const cart = DB.getCart();
-  const qty = parseInt(document.getElementById('qty-input')?.value) || 1;
-  const existing = cart.find(c => c.userId === state.user.id && c.productId === productId);
-  if (existing) existing.quantity = Math.min(existing.quantity + qty, 99);
-  else cart.push({ userId: state.user.id, productId, quantity: qty });
-  DB.setCart(cart);
-  toast('Adicionado ao carrinho!', 'success');
-  renderNav();
-}
-
-function removeFromCart(productId) {
-  DB.setCart(DB.getCart().filter(c => !(c.userId === state.user.id && c.productId === productId)));
-  renderNav();
-}
-
-function updateCartQty(productId, delta) {
-  const cart = DB.getCart();
-  const item = cart.find(c => c.userId === state.user.id && c.productId === productId);
-  if (item) {
-    item.quantity = Math.max(1, item.quantity + delta);
-    DB.setCart(cart);
-    render();
-  }
-}
-
-function toggleFav(productId) {
-  if (!state.user) { showLogin(); return; }
-  const favs = DB.getFavs();
-  const idx = favs.findIndex(f => f.userId === state.user.id && f.productId === productId);
-  if (idx >= 0) { favs.splice(idx, 1); toast('Removido dos favoritos', 'info'); }
-  else { favs.push({ userId: state.user.id, productId }); toast('Adicionado aos favoritos!', 'success'); }
-  DB.setFavs(favs);
-  renderNav();
-  render();
-}
-
-function checkoutCart() {
-  const cartItems = DB.getCart().filter(c => c.userId === state.user.id);
-  if (cartItems.length === 0) return;
-  ssSet('checkout_cart', cartItems);
-  navigate('checkout', { id: 'cart' });
-}
-
-function buyNow(productId) {
-  if (!state.user) { showLogin(); return; }
-  const qty = parseInt(document.getElementById('qty-input')?.value) || 1;
-  ssSet('buy_now', { productId, quantity: qty });
-  navigate('checkout', { id: productId });
-}
-
-// ─── CHECKOUT ─────────────────────────────────────────────────
-function renderCheckout() {
-  if (!state.user) { showLogin(); return ''; }
-  const isCart = state.params.id === 'cart';
-  const cartItems = isCart ? ssGet('checkout_cart', []) : null;
-  const buyNowData = !isCart ? ssGet('buy_now', null) : null;
-
-  let items = [];
-  let total = 0;
-  const products = DB.getProducts();
-  const coupon = ssGet('applied_coupon', null);
-
-  if (isCart && cartItems) {
-    items = cartItems.map(c => {
-      const p = products.find(pr => pr.id === c.productId);
-      if (!p) return null;
-      const sub = p.price * c.quantity;
-      total += sub;
-      return { product: p, quantity: c.quantity, subtotal: sub };
-    }).filter(Boolean);
-  } else if (buyNowData) {
-    const p = products.find(pr => pr.id === buyNowData.productId);
-    if (p) { const sub = p.price * buyNowData.quantity; total += sub; items = [{ product: p, quantity: buyNowData.quantity, subtotal: sub }]; }
-  }
-
-  const discountedTotal = coupon ? total * (1 - coupon.discount / 100) : total;
-
-  // ⚡ FIX: Store order data globally to avoid JSON serialization in onclick attribute
-  _pendingOrderData = {
-    total: discountedTotal,
-    originalTotal: total,
-    items: items.map(i => ({ id: i.product.id, qty: i.quantity, price: i.product.price })),
-  };
-
-  return `
-    <div class="page-container" style="padding-top:24px">
-      <button class="btn btn-outline btn-sm" style="margin-bottom:20px" onclick="history.back()">← Voltar</button>
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:20px">CHECKOUT</h2>
-      <div class="checkout-layout">
-        <div>
-          <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin-bottom:16px">DADOS DE ENTREGA</h3>
-          <div class="form-group"><label>Nome completo *</label><input class="form-control" id="co-name" value="${state.user.username}"></div>
-          <div class="form-group"><label>E-mail *</label><input class="form-control" id="co-email" type="email" value="${state.user.email || ''}"></div>
-          <div class="form-group"><label>Telefone *</label><input class="form-control" id="co-phone" value="${state.user.phone || ''}" type="tel"></div>
-          <div class="divider"></div>
-          <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin-bottom:16px">ENDEREÇO</h3>
-          <div class="two-col">
-            <div class="form-group"><label>CEP *</label><input class="form-control" id="co-cep" placeholder="00000-000" oninput="fetchCEP(this.value)"></div>
-            <div class="form-group"><label>Número *</label><input class="form-control" id="co-num"></div>
-          </div>
-          <div class="form-group"><label>Rua *</label><input class="form-control" id="co-street"></div>
-          <div class="two-col">
-            <div class="form-group"><label>Bairro</label><input class="form-control" id="co-neighborhood"></div>
-            <div class="form-group"><label>Complemento</label><input class="form-control" id="co-complement"></div>
-          </div>
-          <div class="two-col">
-            <div class="form-group"><label>Cidade *</label><input class="form-control" id="co-city"></div>
-            <div class="form-group"><label>Estado *</label><input class="form-control" id="co-state"></div>
-          </div>
-        </div>
-        <div>
-          <div class="cart-summary">
-            <h3>RESUMO</h3>
-            ${items.map(i => `
-              <div class="summary-row" style="align-items:center;gap:8px">
-                <img src="${i.product.images[0]}" style="width:36px;height:36px;object-fit:cover;border-radius:4px;flex-shrink:0" onerror="this.style.display='none'">
-                <span style="flex:1;font-size:12px">${i.product.title} ×${i.quantity}</span>
-                <span>${fmt(i.subtotal)}</span>
-              </div>
-            `).join('')}
-            ${coupon ? `<div class="summary-row" style="color:var(--success)"><span>Cupom (${coupon.discount}%)</span><span>-${fmt(total - discountedTotal)}</span></div>` : ''}
-            <div class="summary-row total"><span>Total</span><span>${fmt(discountedTotal)}</span></div>
-            <button class="btn btn-primary btn-full" style="margin-top:16px" onclick="placeOrder()">
-              Confirmar e Pagar →
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-async function fetchCEP(cep) {
-  const clean = cep.replace(/\D/g, '');
-  if (clean.length !== 8) return;
-  try {
-    const r = await fetch(`https://viacep.com.br/ws/${clean}/json/`);
-    const d = await r.json();
-    if (d.erro) return;
-    document.getElementById('co-street').value = d.logradouro || '';
-    document.getElementById('co-neighborhood').value = d.bairro || '';
-    document.getElementById('co-city').value = d.localidade || '';
-    document.getElementById('co-state').value = d.uf || '';
-  } catch {}
-}
-
-// ⚡ FIX: placeOrder reads from global _pendingOrderData instead of inline params
-function placeOrder() {
-  if (!state.user) return;
-  if (!_pendingOrderData) { toast('Erro ao processar pedido. Tente novamente.', 'error'); return; }
-
-  const { total, originalTotal, items: itemsData } = _pendingOrderData;
-
-  const name = document.getElementById('co-name')?.value?.trim();
-  const email = document.getElementById('co-email')?.value?.trim();
-  const phone = document.getElementById('co-phone')?.value?.trim();
-  const street = document.getElementById('co-street')?.value?.trim();
-  const num = document.getElementById('co-num')?.value?.trim();
-  const city = document.getElementById('co-city')?.value?.trim();
-  const st = document.getElementById('co-state')?.value?.trim();
-
-  if (!name || !email || !phone || !street || !num || !city || !st) {
-    toast('Preencha todos os campos obrigatórios', 'error'); return;
-  }
-
-  const address = { name, email, phone, street, num, city, state: st,
-    neighborhood: document.getElementById('co-neighborhood')?.value || '',
-    complement: document.getElementById('co-complement')?.value || '' };
-
-  const coupon = ssGet('applied_coupon', null);
-  const products = DB.getProducts();
-  const orders = DB.getOrders();
-  let firstOrderId = null;
-
-  const bySeller = {};
-  itemsData.forEach(item => {
-    const p = products.find(pr => pr.id === item.id);
-    if (!p) return;
-    if (!bySeller[p.sellerId]) bySeller[p.sellerId] = [];
-    bySeller[p.sellerId].push({ ...item, sellerId: p.sellerId, productId: p.id });
-  });
-
-  Object.entries(bySeller).forEach(([sellerId, sellerItems]) => {
-    const seller = DB.getUsers().find(u => u.id === sellerId);
-    const orderTotal = sellerItems.reduce((a, i) => a + i.price * i.qty, 0) * (coupon && coupon.sellerId === sellerId ? (1 - coupon.discount / 100) : 1);
-    const pixKey = seller?.pixKey || `${sellerId}@redzinmarket.com`;
-    const order = {
-      id: uid(), buyerId: state.user.id, sellerId, productId: sellerItems[0].productId,
-      quantity: sellerItems[0].qty, items: sellerItems, address,
-      total: parseFloat(orderTotal.toFixed(2)),
-      coupon: coupon && coupon.sellerId === sellerId ? coupon : null,
-      pixKey,
-      status: 'pending_payment',
-      createdAt: new Date().toISOString(),
-      tracking: [{ status: 'Pedido realizado', date: new Date().toISOString(), location: 'REDZIN MARKET' }],
-    };
-    if (!firstOrderId) firstOrderId = order.id;
-    orders.push(order);
-
-    const notifs = DB.getNotifs();
-    const p = products.find(pr => pr.id === sellerItems[0].productId);
-    notifs.push({
-      id: uid(), userId: sellerId, type: 'order',
-      message: `🛍 Novo pedido de ${state.user.username}: ${p?.title || 'Produto'} — ${fmt(orderTotal)}`,
-      orderId: order.id, read: false, createdAt: new Date().toISOString(),
-    });
-    DB.setNotifs(notifs);
-  });
-
-  DB.setOrders(orders);
-  ssRemove('applied_coupon');
-  ssRemove('buy_now');
-  ssRemove('checkout_cart');
-  DB.setCart(DB.getCart().filter(c => c.userId !== state.user.id || !itemsData.find(i => i.id === c.productId)));
-
-  _pendingOrderData = null;
-  navigate('payment', { id: firstOrderId });
-}
-
-function getSellerPixKey(sellerId) {
-  const seller = DB.getUsers().find(u => u.id === sellerId);
-  return seller?.pixKey || `${sellerId}@redzinmarket.com`;
-}
-
-// ─── PAYMENT PAGE ──────────────────────────────────────────────
-function renderPayment() {
-  const order = DB.getOrders().find(o => o.id === state.params.id);
-  if (!order) return `<div class="page-container"><div class="empty-state"><div class="icon">😕</div><h3>Pedido não encontrado</h3></div></div>`;
-  const product = DB.getProducts().find(p => p.id === order.productId);
-  const isPaid = order.status !== 'pending_payment';
-
-  return `
-    <div class="page-container" style="padding-top:24px">
-      <div class="payment-box">
-        ${isPaid ? `
-          <div style="font-size:56px;margin-bottom:14px">✅</div>
-          <h2>PAGAMENTO<br>CONFIRMADO</h2>
-          <p style="color:var(--text2);margin:14px 0">Pedido confirmado! Vendedor notificado.</p>
-          <button class="btn btn-primary" onclick="navigate('tracking',{id:'${order.id}'})">Rastrear pedido →</button>
-        ` : `
-          <h2>PAGUE VIA<br>PIX</h2>
-          <p style="color:var(--text2);font-size:13px">${product?.title || 'Produto'} — ${fmt(order.total)}</p>
-          <div id="qrcode"></div>
-          <p style="font-size:11px;color:var(--text3);margin-bottom:6px">Ou copie a chave PIX:</p>
-          <div class="pix-key-box">
-            <span id="pix-key-text">${order.pixKey}</span>
-            <button class="btn btn-outline btn-sm" onclick="copyPixKey('${order.pixKey}')">Copiar</button>
-          </div>
-          <div class="payment-status pending" id="payment-status">⏳ Aguardando confirmação...</div>
-          <div class="countdown" id="payment-countdown">10:00</div>
-          <div class="progress-bar"><div class="progress-fill" id="payment-progress" style="width:100%"></div></div>
-          <p style="font-size:11px;color:var(--text3);margin-bottom:14px">Após pagar, confirme abaixo</p>
-          <button class="btn btn-success btn-full" onclick="simulatePayment('${order.id}')">✓ Já realizei o pagamento</button>
-          <button class="btn btn-outline btn-full" style="margin-top:8px" onclick="navigate('tracking',{id:'${order.id}'})">Rastrear pedido</button>
-        `}
-      </div>
-    </div>
-  `;
-}
-
-function attachEvents() {
-  if (state.route === 'payment') {
-    const order = DB.getOrders().find(o => o.id === state.params.id);
-    if (order && order.status === 'pending_payment') {
-      setTimeout(() => {
-        const qrContainer = document.getElementById('qrcode');
-        if (qrContainer && typeof QRCode !== 'undefined') {
-          new QRCode(qrContainer, {
-            text: generatePixPayload(order.total, order.pixKey),
-            width: 180, height: 180,
-            colorDark: '#000000', colorLight: '#ffffff',
-          });
-        }
-        startPaymentCountdown(order.id);
-      }, 100);
+// ===== SELLER DASHBOARD =====
+function renderDash(el) {
+  if (!state.user || !state.user.isSeller) { go('home'); return; }
+  Promise.all([api('GET', '/products'), api('GET', '/orders?sellerId=' + state.user.id)]).then(function(r) {
+    var myP = (r[0].products || []).filter(function(p) { return p.sellerId === state.user.id; });
+    var orders = r[1].orders || [];
+    var rev = 0; for (var i = 0; i < orders.length; i++) if (orders[i].status !== 'pending_payment') rev += orders[i].total;
+    var h = '<div class="container" style="padding-top:20px">';
+    h += '<h2 class="section-title">PAINEL DO VENDEDOR</h2>';
+    h += '<p style="color:var(--text3);margin-bottom:20px">Olá, ' + state.user.username + '!</p>';
+    h += '<div class="dash-grid">';
+    h += '<div class="dash-card"><div class="num">' + myP.length + '</div><div class="label">Produtos</div></div>';
+    h += '<div class="dash-card"><div class="num">' + orders.length + '</div><div class="label">Pedidos</div></div>';
+    h += '<div class="dash-card"><div class="num" style="font-size:18px">' + fmt(rev) + '</div><div class="label">Receita</div></div>';
+    h += '</div><div class="action-grid">';
+    h += '<button class="btn btn-primary" onclick="go(\'add-product\')">+ Anunciar</button>';
+    h += '<button class="btn btn-outline" onclick="go(\'seller-products\')">Produtos</button>';
+    h += '<button class="btn btn-outline" onclick="go(\'seller-coupons\')">Cupons</button>';
+    h += '<button class="btn btn-outline" onclick="go(\'seller-pix\')">PIX</button>';
+    h += '</div><h3 class="section-title">PEDIDOS RECENTES</h3>';
+    if (orders.length === 0) h += '<div class="empty"><div class="empty-icon">📦</div><h3>Nenhum pedido</h3></div>';
+    else for (var j = 0; j < Math.min(orders.length, 5); j++) {
+      var o = orders[j];
+      h += '<div class="list-item" onclick="go(\'tracking\',{id:\'' + o.id + '\'})"><div class="list-item-info"><div class="list-item-title">Pedido ' + o.id.slice(0, 8) + '</div><div class="list-item-sub">' + timeAgo(o.createdAt) + '</div><div class="list-item-price">' + fmt(o.total) + '</div></div><div style="font-size:12px;color:var(--text2)">' + o.status + '</div></div>';
     }
-  }
-}
-
-function generatePixPayload(amount, key) {
-  return `00020126580014BR.GOV.BCB.PIX0136${key}5204000053039865406${amount.toFixed(2)}5802BR5913REDZIN MARKET6009SAO PAULO62140510REDZINMKT6304ABCD`;
-}
-
-function startPaymentCountdown(orderId) {
-  let seconds = 600;
-  const interval = setInterval(() => {
-    seconds--;
-    const min = Math.floor(seconds / 60);
-    const sec = seconds % 60;
-    const cd = document.getElementById('payment-countdown');
-    const pb = document.getElementById('payment-progress');
-    if (cd) cd.textContent = `${String(min).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
-    if (pb) pb.style.width = `${(seconds / 600) * 100}%`;
-    if (seconds <= 0) clearInterval(interval);
-    const order = DB.getOrders().find(o => o.id === orderId);
-    if (order && order.status !== 'pending_payment') clearInterval(interval);
-  }, 1000);
-}
-
-function copyPixKey(key) {
-  navigator.clipboard.writeText(key).then(() => toast('Chave PIX copiada!', 'success')).catch(() => {
-    const el = document.createElement('textarea');
-    el.value = key; document.body.appendChild(el); el.select();
-    document.execCommand('copy'); el.remove();
-    toast('Chave PIX copiada!', 'success');
+    h += '</div>';
+    el.innerHTML = h;
   });
 }
 
-function simulatePayment(orderId) {
-  const btn = event.target;
-  btn.textContent = 'Verificando...';
-  btn.disabled = true;
-  setTimeout(() => confirmPayment(orderId), 2000);
-}
-
-function confirmPayment(orderId) {
-  const orders = DB.getOrders();
-  const idx = orders.findIndex(o => o.id === orderId);
-  if (idx < 0) return;
-  orders[idx].status = 'paid';
-  orders[idx].paidAt = new Date().toISOString();
-  orders[idx].tracking.push({ status: 'Pagamento confirmado', date: new Date().toISOString(), location: 'Sistema financeiro' });
-  DB.setOrders(orders);
-
-  const order = orders[idx];
-  const notifs = DB.getNotifs();
-  const product = DB.getProducts().find(p => p.id === order.productId);
-  notifs.push({ id: uid(), userId: order.sellerId, type: 'sale', message: `🛍 Novo pedido! ${product?.title || 'Produto'} — ${fmt(order.total)} — de ${state.user?.username || 'comprador'}`, orderId: order.id, read: false, createdAt: new Date().toISOString() });
-  DB.setNotifs(notifs);
-
-  const products = DB.getProducts();
-  const pi = products.findIndex(p => p.id === order.productId);
-  if (pi >= 0) { products[pi].sold = (products[pi].sold || 0) + order.quantity; DB.setProducts(products); }
-
-  const statusEl = document.getElementById('payment-status');
-  if (statusEl) { statusEl.className = 'payment-status confirmed'; statusEl.textContent = '✓ Pagamento confirmado!'; }
-  setTimeout(() => render(), 1500);
-}
-
-// ─── TRACKING ────────────────────────────────────────────────
-function renderTracking() {
-  const order = DB.getOrders().find(o => o.id === state.params.id);
-  if (!order) return `<div class="page-container"><div class="empty-state"><div class="icon">😕</div><h3>Pedido não encontrado</h3></div></div>`;
-
-  const product = DB.getProducts().find(p => p.id === order.productId);
-  const isSeller = state.user && state.user.id === order.sellerId;
-  const buyer = DB.getUsers().find(u => u.id === order.buyerId);
-
-  const statusLabels = {
-    pending_payment: { label: '⏳ Aguardando Pagamento', color: 'var(--warning)' },
-    paid: { label: '✓ Pago', color: 'var(--success)' },
-    processing: { label: '⚙ Processando', color: 'var(--text2)' },
-    shipped: { label: '🚚 Enviado', color: '#4488ff' },
-    delivered: { label: '✅ Entregue', color: 'var(--success)' },
-  };
-  const st = statusLabels[order.status] || { label: order.status, color: 'var(--text2)' };
-
-  const trackingSteps = (order.tracking || []).map(t => `
-    <div class="tracking-step done">
-      <div class="tracking-step-dot"></div>
-      <div class="tracking-step-title">${t.status}</div>
-      <div class="tracking-step-date">${t.location} • ${new Date(t.date).toLocaleString('pt-BR')}</div>
-    </div>
-  `).join('');
-
-  const sellerUser = DB.getUsers().find(u => u.id === order.sellerId);
-  const chatBtn = isSeller && buyer ? `
-    <a class="chat-seller-btn" style="margin-top:16px;display:flex;align-items:center;justify-content:center;gap:8px;text-decoration:none;" href="https://wa.me/55${(buyer.phone||'').replace(/\D/g,'')}" target="_blank">
-      <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
-      Falar com o comprador (${buyer.username}) no WhatsApp
-    </a>
-  ` : !isSeller ? `
-    <a class="chat-seller-btn" style="margin-top:16px;display:flex;align-items:center;justify-content:center;gap:8px;text-decoration:none;" href="https://wa.me/55${(sellerUser?.phone||'').replace(/\D/g,'')}" target="_blank">
-      <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
-      Falar com o vendedor no WhatsApp
-    </a>
-  ` : '';
-
-  const sellerPanel = isSeller ? `
-    <div class="divider"></div>
-    <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin-bottom:14px">ATUALIZAR RASTREAMENTO</h3>
-    <div class="form-group"><label>Status</label>
-      <select class="form-control" id="track-status">
-        <option value="processing" ${order.status === 'processing' ? 'selected' : ''}>⚙ Processando</option>
-        <option value="shipped" ${order.status === 'shipped' ? 'selected' : ''}>🚚 Enviado</option>
-        <option value="delivered" ${order.status === 'delivered' ? 'selected' : ''}>✅ Entregue</option>
-      </select>
-    </div>
-    <div class="form-group"><label>Localização</label><input class="form-control" id="track-location" placeholder="Ex: Centro de Triagem SP"></div>
-    <div class="form-group"><label>Descrição</label><input class="form-control" id="track-desc" placeholder="Ex: Produto saiu para entrega"></div>
-    <button class="btn btn-primary" onclick="updateTracking('${order.id}')">Atualizar</button>
-    ${chatBtn}
-  ` : chatBtn;
-
-  return `
-    <div class="page-container" style="padding-top:24px;max-width:700px;margin:0 auto">
-      <button class="btn btn-outline btn-sm" style="margin-bottom:20px" onclick="history.back()">← Voltar</button>
-      <div style="display:flex;align-items:center;gap:14px;margin-bottom:20px;flex-wrap:wrap">
-        <img src="${product?.images[0]}" style="width:54px;height:54px;object-fit:cover;border-radius:8px;border:1px solid var(--border)" onerror="this.style.display='none'">
-        <div>
-          <h2 style="font-family:'Bebas Neue',sans-serif;font-size:22px;letter-spacing:2px">${product?.title || 'Produto'}</h2>
-          <div style="color:${st.color};font-size:13px;font-weight:600;margin-top:3px">${st.label}</div>
-        </div>
-        <div style="margin-left:auto;font-family:'Space Mono',monospace;font-size:18px;font-weight:700">${fmt(order.total)}</div>
-      </div>
-
-      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius2);padding:20px;margin-bottom:16px">
-        <h3 style="font-family:'Bebas Neue',sans-serif;font-size:16px;letter-spacing:2px;margin-bottom:14px">ENDEREÇO</h3>
-        <p style="font-size:13px;color:var(--text2)">${order.address.name} • ${order.address.phone}</p>
-        <p style="font-size:13px;color:var(--text2)">${order.address.street}, ${order.address.num}</p>
-        <p style="font-size:13px;color:var(--text2)">${order.address.city} — ${order.address.state}</p>
-      </div>
-
-      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius2);padding:20px">
-        <h3 style="font-family:'Bebas Neue',sans-serif;font-size:16px;letter-spacing:2px;margin-bottom:16px">RASTREAMENTO</h3>
-        <div class="tracking-steps">${trackingSteps || '<p style="color:var(--text3)">Sem atualizações</p>'}</div>
-        ${sellerPanel}
-      </div>
-    </div>
-  `;
-}
-
-function updateTracking(orderId) {
-  const status = document.getElementById('track-status')?.value;
-  const location = document.getElementById('track-location')?.value?.trim() || 'Não especificado';
-  const desc = document.getElementById('track-desc')?.value?.trim() || status;
-
-  const orders = DB.getOrders();
-  const idx = orders.findIndex(o => o.id === orderId);
-  if (idx < 0) return;
-  orders[idx].status = status;
-  orders[idx].tracking.push({ status: desc, date: new Date().toISOString(), location });
-  DB.setOrders(orders);
-
-  const order = orders[idx];
-  const notifs = DB.getNotifs();
-  const product = DB.getProducts().find(p => p.id === order.productId);
-  notifs.push({ id: uid(), userId: order.buyerId, type: 'tracking', message: `📦 Pedido "${product?.title}": ${desc} — ${location}`, orderId: order.id, read: false, createdAt: new Date().toISOString() });
-  DB.setNotifs(notifs);
-
-  toast('Rastreamento atualizado!', 'success');
-  render();
-}
-
-// ─── NOTIFICATIONS ────────────────────────────────────────────
-function renderNotifications() {
-  if (!state.user) { showLogin(); return ''; }
-  const notifs = DB.getNotifs().filter(n => n.userId === state.user.id).reverse();
-  const allNotifs = DB.getNotifs();
-  allNotifs.forEach(n => { if (n.userId === state.user.id) n.read = true; });
-  DB.setNotifs(allNotifs);
-
-  return `
-    <div class="page-container" style="padding-top:24px;max-width:700px;margin:0 auto">
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:20px">🔔 NOTIFICAÇÕES</h2>
-      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius2);overflow:hidden">
-        ${notifs.length === 0 ? `<div class="empty-state"><div class="icon">🔔</div><h3>Nenhuma notificação</h3></div>` :
-          notifs.map(n => `
-            <div class="notif-item ${n.read ? '' : 'unread'}" onclick="${n.orderId ? `navigate('tracking',{id:'${n.orderId}'})` : n.chatRoomId ? `openChat('${n.otherUserId}')` : ''}">
-              <div class="notif-dot ${n.read ? 'read' : ''}"></div>
-              <div>
-                <div class="notif-text">${n.message}</div>
-                <div class="notif-time">${timeAgo(n.createdAt)}</div>
-              </div>
-            </div>
-          `).join('')
-        }
-      </div>
-    </div>
-  `;
-}
-
-// ─── ORDERS PAGE ──────────────────────────────────────────────
-function renderOrders() {
-  if (!state.user) { showLogin(); return ''; }
-  const orders = DB.getOrders().filter(o => o.buyerId === state.user.id).reverse();
-  return `
-    <div class="page-container" style="padding-top:24px">
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:20px">📦 MEUS PEDIDOS</h2>
-      ${orders.length === 0 ? `<div class="empty-state"><div class="icon">📦</div><h3>Nenhum pedido ainda</h3></div>` :
-        orders.map(o => renderOrderCard(o)).join('')}
-    </div>
-  `;
-}
-
-// ─── SELLER DASHBOARD ─────────────────────────────────────────
-function renderSellerDashboard() {
-  if (!state.user?.isSeller) { toast('Acesso negado', 'error'); navigate('home'); return ''; }
-  const orders = DB.getOrders().filter(o => o.sellerId === state.user.id);
-  const products = DB.getProducts().filter(p => p.sellerId === state.user.id);
-  const totalRevenue = orders.filter(o => o.status !== 'pending_payment').reduce((a, o) => a + o.total, 0);
-  const notifs = DB.getNotifs().filter(n => n.userId === state.user.id && !n.read).length;
-  const chatUnread = getUnreadChatCount();
-  const u = state.user;
-  const hasPixKey = !!(u.pixKey);
-
-  return `
-    <div class="page-container" style="padding-top:24px">
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:6px">PAINEL DO VENDEDOR</h2>
-      <p style="color:var(--text3);margin-bottom:24px">Olá, ${state.user.username}!</p>
-
-      ${!hasPixKey ? `
-      <div style="background:rgba(255,204,0,0.07);border:1px solid rgba(255,204,0,0.3);border-radius:var(--radius2);padding:16px;margin-bottom:20px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-        <span style="font-size:24px">⚠️</span>
-        <div style="flex:1">
-          <div style="font-size:13px;font-weight:600;color:var(--warning)">Chave PIX não cadastrada</div>
-          <div style="font-size:12px;color:var(--text3)">Configure sua chave PIX para receber pagamentos dos clientes.</div>
-        </div>
-        <button class="btn btn-outline btn-sm" style="border-color:var(--warning);color:var(--warning)" onclick="navigate('seller-pix')">Configurar PIX →</button>
-      </div>
-      ` : ''}
-
-      <div class="dash-grid">
-        <div class="dash-card">
-          <div class="num">${products.length}</div>
-          <div class="label">Produtos</div>
-        </div>
-        <div class="dash-card">
-          <div class="num">${orders.length}</div>
-          <div class="label">Pedidos</div>
-        </div>
-        <div class="dash-card">
-          <div class="num" style="font-size:24px">${fmt(totalRevenue)}</div>
-          <div class="label">Receita</div>
-        </div>
-        <div class="dash-card">
-          <div class="num">${notifs}</div>
-          <div class="label">Notificações</div>
-        </div>
-      </div>
-
-      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;margin-bottom:28px" class="dash-btns-grid">
-        <button class="btn btn-primary" onclick="navigate('add-product')">+ Anunciar</button>
-        <button class="btn btn-outline" onclick="navigate('seller-products')">Meus Produtos</button>
-        <button class="btn btn-outline" onclick="navigate('seller-coupons')">Cupons</button>
-        <button class="btn btn-outline" onclick="navigate('seller-pix')">💳 Chave PIX ${hasPixKey ? '✓' : '⚠'}</button>
-        <button class="btn btn-outline" onclick="navigate('notifications')">🔔 ${notifs > 0 ? `(${notifs})` : 'Notifs'}</button>
-      </div>
-
-      <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin-bottom:14px">PEDIDOS RECENTES</h3>
-      ${orders.length === 0 ? `<div class="empty-state"><div class="icon">📦</div><h3>Nenhum pedido ainda</h3></div>` :
-        [...orders].reverse().slice(0, 5).map(o => {
-          const product = DB.getProducts().find(p => p.id === o.productId);
-          const buyer = DB.getUsers().find(u => u.id === o.buyerId);
-          return `
-            <div class="cart-item" style="cursor:pointer" onclick="navigate('tracking',{id:'${o.id}'})">
-              <img class="cart-item-img" src="${product?.images[0]}" onerror="this.src='https://via.placeholder.com/80x80/111/444?text=?'">
-              <div class="cart-item-info">
-                <div class="cart-item-title">${product?.title || 'Produto'}</div>
-                <div style="font-size:11px;color:var(--text3)">${buyer?.username || 'Comprador'} • ${timeAgo(o.createdAt)}</div>
-                <div class="cart-item-price">${fmt(o.total)}</div>
-              </div>
-              <div style="font-size:12px;color:var(--text2)">${o.status}</div>
-            </div>
-          `;
-        }).join('')
+// ===== MY PRODUCTS =====
+function renderMyProducts(el) {
+  if (!state.user || !state.user.isSeller) { go('home'); return; }
+  api('GET', '/products').then(function(data) {
+    var myP = (data.products || []).filter(function(p) { return p.sellerId === state.user.id; });
+    var h = '<div class="container" style="padding-top:20px">';
+    h += '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">';
+    h += '<h2 class="section-title" style="margin:0">MEUS PRODUTOS</h2>';
+    h += '<button class="btn btn-primary btn-sm" onclick="go(\'add-product\')">+ Novo</button></div>';
+    if (myP.length === 0) {
+      h += '<div class="empty"><div class="empty-icon">📦</div><h3>Nenhum produto</h3><button class="btn btn-primary" onclick="go(\'add-product\')" style="margin-top:14px">Anunciar</button></div>';
+    } else {
+      for (var i = 0; i < myP.length; i++) {
+        var p = myP[i];
+        h += '<div class="list-item"><img class="list-item-img" src="' + (p.images[0] || '') + '" onerror="this.src=\'https://placehold.co/56x56/111/444?text=?\'">';
+        h += '<div class="list-item-info"><div class="list-item-title">' + p.title + '</div><div class="list-item-sub">' + fmt(p.price) + ' · ' + p.stock + ' est · ' + (p.sold || 0) + ' vend</div></div>';
+        h += '<div style="display:flex;gap:6px;flex-shrink:0"><button class="btn btn-outline btn-sm" onclick="event.stopPropagation();go(\'edit-product\',{id:\'' + p.id + '\'})">✏️</button>';
+        h += '<button class="btn btn-sm" style="background:none;border:1px solid var(--danger);color:var(--danger)" onclick="event.stopPropagation();delProduct(\'' + p.id + '\')">🗑</button></div></div>';
       }
-    </div>
-  `;
+    }
+    h += '</div>';
+    el.innerHTML = h;
+  });
+}
+function delProduct(id) {
+  if (!confirm('Excluir?')) return;
+  api('POST', '/product/delete', { id: id }).then(function() { toast('Excluído', 'info'); render(); });
 }
 
-// ─── SELLER PRODUCTS ─────────────────────────────────────────
-function renderSellerProducts() {
-  if (!state.user?.isSeller) { navigate('home'); return ''; }
-  const products = DB.getProducts().filter(p => p.sellerId === state.user.id);
-
-  return `
-    <div class="page-container" style="padding-top:24px">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:12px">
-        <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px">MEUS PRODUTOS</h2>
-        <button class="btn btn-primary btn-sm" onclick="navigate('add-product')">+ Novo</button>
-      </div>
-      ${products.length === 0 ? `<div class="empty-state"><div class="icon">📦</div><h3>Nenhum produto ainda</h3><button class="btn btn-primary" onclick="navigate('add-product')" style="margin-top:14px">Anunciar produto</button></div>` :
-        `<div style="display:grid;gap:10px">
-          ${products.map(p => `
-            <div style="display:flex;gap:14px;padding:14px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);align-items:center">
-              <img src="${p.images[0]}" style="width:56px;height:56px;object-fit:cover;border-radius:8px;border:1px solid var(--border);flex-shrink:0" onerror="this.src='https://via.placeholder.com/64x64/111/444?text=?'">
-              <div style="flex:1;min-width:0">
-                <div style="font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.title}</div>
-                <div style="font-size:12px;color:var(--text3)">${fmt(p.price)} • ${p.stock} estoque • ${p.sold||0} vendidos</div>
-              </div>
-              <div style="display:flex;gap:6px;flex-shrink:0">
-                <button class="btn btn-outline btn-sm" onclick="navigate('edit-product',{id:'${p.id}'})">Editar</button>
-                <button class="btn btn-sm" style="background:none;border:1px solid var(--danger);color:var(--danger);padding:8px 10px" onclick="deleteProduct('${p.id}')">×</button>
-              </div>
-            </div>
-          `).join('')}
-        </div>`
-      }
-    </div>
-  `;
+// ===== ADD PRODUCT =====
+function renderAddProduct(el) {
+  if (!state.user || !state.user.isSeller) { go('home'); return; }
+  var h = '<div class="container" style="padding-top:20px;max-width:680px;margin:0 auto">';
+  h += '<button class="btn btn-outline btn-sm" style="margin-bottom:16px" onclick="go(\'seller-products\')">← Voltar</button>';
+  h += '<h2 class="section-title">ANUNCIAR PRODUTO</h2>';
+  h += '<div class="form-group"><label>Título *</label><input class="form-control" id="p-title" placeholder="Nome do produto"></div>';
+  h += '<div class="form-group"><label>Descrição *</label><textarea class="form-control" id="p-desc" placeholder="Descreva..." style="min-height:100px"></textarea></div>';
+  h += '<div class="two-col"><div class="form-group"><label>Preço *</label><input class="form-control" id="p-price" type="number" step="0.01"></div>';
+  h += '<div class="form-group"><label>Original</label><input class="form-control" id="p-orig" type="number" step="0.01"></div></div>';
+  h += '<div class="two-col"><div class="form-group"><label>Estoque *</label><input class="form-control" id="p-stock" type="number"></div>';
+  h += '<div class="form-group"><label>Categoria *</label><select class="form-control" id="p-cat">';
+  var cats = ['moda','eletronicos','acessorios','bolsas','beleza','casa','esporte'];
+  for (var i = 0; i < cats.length; i++) h += '<option value="' + cats[i] + '">' + cats[i] + '</option>';
+  h += '</select></div></div>';
+  h += '<div class="form-group"><label>URLs das imagens (uma por linha)</label><textarea class="form-control" id="p-imgs" placeholder="https://..." style="min-height:70px"></textarea></div>';
+  h += '<div class="form-group"><label>Upload</label><label class="btn btn-outline btn-sm" for="p-file" style="cursor:pointer">Selecionar</label><input type="file" id="p-file" accept="image/*" multiple onchange="uploadImgs(event)" style="display:none"><div class="img-previews" id="p-prev"></div></div>';
+  h += '<button class="btn btn-primary btn-full" onclick="saveProd()">Publicar</button>';
+  h += '</div>';
+  el.innerHTML = h;
 }
-
-function deleteProduct(id) {
-  if (!confirm('Excluir este produto?')) return;
-  DB.setProducts(DB.getProducts().filter(p => p.id !== id));
-  toast('Produto excluído', 'info');
-  render();
-}
-
-// ─── ADD/EDIT PRODUCT ──────────────────────────────────────────
-function renderAddProduct() {
-  if (!state.user?.isSeller) { navigate('home'); return ''; }
-  return `
-    <div class="page-container" style="padding-top:24px;max-width:680px;margin:0 auto">
-      <button class="btn btn-outline btn-sm" style="margin-bottom:20px" onclick="history.back()">← Voltar</button>
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:20px">ANUNCIAR PRODUTO</h2>
-      <div class="form-group"><label>Título *</label><input class="form-control" id="prod-title" placeholder="Nome do produto"></div>
-      <div class="form-group"><label>Descrição *</label><textarea class="form-control" id="prod-desc" placeholder="Descreva o produto..." style="min-height:100px"></textarea></div>
-      <div class="two-col">
-        <div class="form-group"><label>Preço (R$) *</label><input class="form-control" id="prod-price" type="number" step="0.01" inputmode="decimal"></div>
-        <div class="form-group"><label>Preço original</label><input class="form-control" id="prod-orig" type="number" step="0.01" inputmode="decimal"></div>
-      </div>
-      <div class="two-col">
-        <div class="form-group"><label>Estoque *</label><input class="form-control" id="prod-stock" type="number" inputmode="numeric"></div>
-        <div class="form-group"><label>Categoria *</label>
-          <select class="form-control" id="prod-cat">
-            ${['moda','eletronicos','acessorios','bolsas','beleza','casa','esporte'].map(c => `<option value="${c}">${c}</option>`).join('')}
-          </select>
-        </div>
-      </div>
-      <div class="form-group">
-        <label>Imagens (URLs)</label>
-        <textarea class="form-control" id="prod-images" placeholder="https://exemplo.com/imagem.jpg&#10;Uma URL por linha" style="min-height:70px"></textarea>
-      </div>
-      <div class="form-group">
-        <label>Upload de imagens</label>
-        <label class="btn btn-outline" for="prod-img-upload" style="cursor:pointer;display:inline-flex">📎 Selecionar</label>
-        <input type="file" id="prod-img-upload" accept="image/*" multiple onchange="handleImageUpload(event)">
-        <div class="img-preview-grid" id="img-previews"></div>
-      </div>
-      <button class="btn btn-primary btn-full" onclick="saveProduct()">Publicar produto</button>
-    </div>
-  `;
-}
-
-let uploadedImages = [];
-
-// ─── Upload image to server and get a permanent public URL ───
-async function uploadImageToServer(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = async function(e) {
-      try {
-        const res = await fetch('/upload', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ data: e.target.result, type: file.type })
+var uploaded = [];
+function uploadImgs(ev) {
+  var files = Array.from(ev.target.files);
+  var prev = document.getElementById('p-prev');
+  uploaded = [];
+  prev.innerHTML = '<div style="color:var(--text2);font-size:13px">Enviando...</div>';
+  var done = 0;
+  files.forEach(function(file) {
+    var reader = new FileReader();
+    reader.onload = function(e) {
+      fetch('/upload', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ data: e.target.result, type: file.type }) })
+        .then(function(r) { return r.json(); })
+        .then(function(j) {
+          if (j.url) { uploaded.push(j.url); var img = document.createElement('img'); img.className = 'img-preview'; img.src = j.url; prev.appendChild(img); }
+          done++;
+          if (done === files.length) { var ld = prev.querySelector('div'); if (ld) ld.remove(); toast(uploaded.length + ' enviada(s)', 'success'); }
         });
-        const json = await res.json();
-        if (json.url) resolve(json.url);
-        else reject(new Error(json.error || 'Upload failed'));
-      } catch(err) {
-        // Fallback: use base64 locally if server unreachable
-        console.warn('Server upload failed, using local base64:', err.message);
-        resolve(e.target.result);
-      }
     };
     reader.readAsDataURL(file);
   });
 }
+function saveProd(editId) {
+  var title = document.getElementById('p-title').value.trim();
+  var desc = document.getElementById('p-desc').value.trim();
+  var price = parseFloat(document.getElementById('p-price').value);
+  var orig = parseFloat(document.getElementById('p-orig').value) || null;
+  var stock = parseInt(document.getElementById('p-stock').value) || 0;
+  var cat = document.getElementById('p-cat').value;
+  var urls = document.getElementById('p-imgs').value.split('\n').filter(function(u) { return u.trim(); });
+  var imgs = uploaded.concat(urls).filter(Boolean);
+  if (!title || !desc || !price || !cat) { toast('Preencha tudo', 'error'); return; }
+  if (imgs.length === 0) imgs = ['https://placehold.co/400x400/111/444?text=' + encodeURIComponent(title)];
+  var prod = { id: editId || uid(), sellerId: state.user.id, title: title, description: desc, price: price, originalPrice: orig, stock: stock, category: cat, images: imgs };
+  api('POST', editId ? '/product/update' : '/product/create', prod).then(function() {
+    toast(editId ? 'Atualizado!' : 'Publicado!', 'success');
+    uploaded = [];
+    go('seller-products');
+  });
+}
 
-async function handleImageUpload(event) {
-  const files = Array.from(event.target.files);
-  const previewContainer = document.getElementById('img-previews');
-  uploadedImages = [];
-  if (files.length === 0) return;
+// ===== EDIT PRODUCT =====
+function renderEditProduct(el) {
+  if (!state.user || !state.user.isSeller) { go('home'); return; }
+  api('GET', '/products').then(function(data) {
+    var p = (data.products || []).find(function(x) { return x.id === state.params.id; });
+    if (!p) { el.innerHTML = '<div class="container"><h3>Não encontrado</h3></div>'; return; }
+    var h = '<div class="container" style="padding-top:20px;max-width:680px;margin:0 auto">';
+    h += '<button class="btn btn-outline btn-sm" style="margin-bottom:16px" onclick="go(\'seller-products\')">← Voltar</button>';
+    h += '<h2 class="section-title">EDITAR PRODUTO</h2>';
+    h += '<div class="form-group"><label>Título *</label><input class="form-control" id="p-title" value="' + p.title + '"></div>';
+    h += '<div class="form-group"><label>Descrição *</label><textarea class="form-control" id="p-desc" style="min-height:100px">' + p.description + '</textarea></div>';
+    h += '<div class="two-col"><div class="form-group"><label>Preço *</label><input class="form-control" id="p-price" type="number" step="0.01" value="' + p.price + '"></div>';
+    h += '<div class="form-group"><label>Original</label><input class="form-control" id="p-orig" type="number" step="0.01" value="' + (p.originalPrice || '') + '"></div></div>';
+    h += '<div class="two-col"><div class="form-group"><label>Estoque *</label><input class="form-control" id="p-stock" type="number" value="' + p.stock + '"></div>';
+    h += '<div class="form-group"><label>Categoria *</label><select class="form-control" id="p-cat">';
+    var cats = ['moda','eletronicos','acessorios','bolsas','beleza','casa','esporte'];
+    for (var i = 0; i < cats.length; i++) h += '<option value="' + cats[i] + '" ' + (p.category === cats[i] ? 'selected' : '') + '>' + cats[i] + '</option>';
+    h += '</select></div></div>';
+    h += '<div class="form-group"><label>Imagens</label><textarea class="form-control" id="p-imgs" style="min-height:70px">' + p.images.join('\n') + '</textarea></div>';
+    h += '<div class="form-group"><div class="img-previews" id="p-prev"></div></div>';
+    h += '<button class="btn btn-primary btn-full" onclick="saveProd(\'' + p.id + '\')">Salvar</button>';
+    h += '</div>';
+    el.innerHTML = h;
+  });
+}
 
-  // Show loading indicator
-  const loadingEl = document.createElement('div');
-  loadingEl.id = 'img-upload-loading';
-  loadingEl.style.cssText = 'color:#a855f7;font-size:13px;padding:8px 0;';
-  loadingEl.textContent = '⏳ Enviando imagem' + (files.length > 1 ? 'ns' : '') + '...';
-  previewContainer.innerHTML = '';
-  previewContainer.appendChild(loadingEl);
-
-  for (const file of files) {
-    try {
-      const url = await uploadImageToServer(file);
-      uploadedImages.push(url);
-      const img = document.createElement('img');
-      img.className = 'img-preview';
-      img.src = url;
-      previewContainer.appendChild(img);
-    } catch(err) {
-      toast('Erro ao enviar imagem: ' + file.name, 'error');
+// ===== COUPONS =====
+function renderCoupons(el) {
+  if (!state.user || !state.user.isSeller) { go('home'); return; }
+  api('GET', '/coupons?sellerId=' + state.user.id).then(function(data) {
+    var coupons = data.coupons || [];
+    var h = '<div class="container" style="padding-top:20px">';
+    h += '<button class="btn btn-outline btn-sm" style="margin-bottom:16px" onclick="go(\'seller-dashboard\')">← Voltar</button>';
+    h += '<h2 class="section-title">CUPONS</h2>';
+    h += '<div class="panel" style="max-width:480px">';
+    h += '<h3 style="font-size:16px;font-weight:700;margin-bottom:14px">Criar Cupom</h3>';
+    h += '<div class="form-group"><label>Código *</label><input class="form-control" id="c-code" placeholder="DESCONTO10" style="text-transform:uppercase"></div>';
+    h += '<div class="two-col"><div class="form-group"><label>Desconto % *</label><input class="form-control" id="c-disc" type="number" min="1" max="100"></div>';
+    h += '<div class="form-group"><label>Usos máx *</label><input class="form-control" id="c-uses" type="number" min="1"></div></div>';
+    h += '<div class="form-group"><label>Descrição</label><input class="form-control" id="c-desc" placeholder="10% primeira compra"></div>';
+    h += '<button class="btn btn-primary btn-full" onclick="mkCoupon()">Criar</button></div>';
+    if (coupons.length === 0) h += '<div class="empty"><div class="empty-icon">🏷</div><h3>Nenhum cupom</h3></div>';
+    else for (var i = 0; i < coupons.length; i++) {
+      var c = coupons[i];
+      h += '<div class="coupon-card"><div><div class="coupon-code">' + c.code + '</div><div class="coupon-info">' + (c.description || '') + ' · ' + c.uses + '/' + c.maxUses + '</div></div>';
+      h += '<div class="coupon-pct">' + c.discount + '%</div>';
+      h += '<div style="display:flex;flex-direction:column;gap:5px"><span class="chip ' + (c.active ? 'chip-on' : 'chip-off') + '">' + (c.active ? 'Ativo' : 'Off') + '</span>';
+      h += '<button class="btn btn-outline btn-sm" onclick="tglCoupon(\'' + c.id + '\',' + (!c.active) + ')">' + (c.active ? 'Desativar' : 'Ativar') + '</button>';
+      h += '<button class="btn btn-sm" style="background:none;border:1px solid var(--danger);color:var(--danger)" onclick="rmCoupon(\'' + c.id + '\')">Excluir</button></div></div>';
     }
-  }
+    h += '</div>';
+    el.innerHTML = h;
+  });
+}
+function mkCoupon() {
+  var code = document.getElementById('c-code').value.trim().toUpperCase();
+  var disc = parseInt(document.getElementById('c-disc').value);
+  var uses = parseInt(document.getElementById('c-uses').value);
+  var desc = document.getElementById('c-desc').value.trim();
+  if (!code || !disc || !uses) { toast('Preencha tudo', 'error'); return; }
+  api('POST', '/coupon/create', { id: uid(), sellerId: state.user.id, code: code, discount: disc, maxUses: uses, description: desc }).then(function() { toast('Cupom criado!', 'success'); render(); });
+}
+function tglCoupon(id, active) { api('POST', '/coupon/toggle', { id: id, active: active }).then(function() { render(); }); }
+function rmCoupon(id) { if (!confirm('Excluir?')) return; api('POST', '/coupon/delete', { id: id }).then(function() { toast('Excluído', 'info'); render(); }); }
 
-  const loadingNode = document.getElementById('img-upload-loading');
-  if (loadingNode) loadingNode.remove();
-
-  if (uploadedImages.length > 0) {
-    toast('✅ ' + uploadedImages.length + ' imagem' + (uploadedImages.length > 1 ? 'ns enviadas' : ' enviada') + '!', 'success');
-  }
+// ===== PIX =====
+function renderPix(el) {
+  if (!state.user || !state.user.isSeller) { go('home'); return; }
+  var h = '<div class="container" style="padding-top:20px;max-width:500px;margin:0 auto">';
+  h += '<button class="btn btn-outline btn-sm" style="margin-bottom:16px" onclick="go(\'seller-dashboard\')">← Voltar</button>';
+  h += '<h2 class="section-title">CHAVE PIX</h2>';
+  h += '<div class="pix-card"><p style="color:var(--text2);font-size:13px;margin-bottom:16px">Configure para receber pagamentos.</p>';
+  h += '<div class="form-group"><label>Tipo</label><select class="form-control" id="pix-type"><option>CPF</option><option>CNPJ</option><option>E-mail</option><option>Telefone</option><option>Aleatória</option></select></div>';
+  h += '<div class="form-group"><label>Chave PIX</label><input class="form-control" id="pix-key" value="' + (state.user.pixKey || '') + '" placeholder="Sua chave"></div>';
+  h += '<button class="btn btn-primary btn-full" onclick="savePix()">Salvar</button></div></div>';
+  el.innerHTML = h;
+}
+function savePix() {
+  var key = document.getElementById('pix-key').value.trim();
+  if (!key) { toast('Digite a chave', 'error'); return; }
+  api('POST', '/update-user', { userId: state.user.id, email: state.user.email, phone: state.user.phone, avatar: state.user.avatar, pixKey: key })
+    .then(function(d) { if (d.success) { setUser(d.user); toast('Salvo!', 'success'); } });
 }
 
-function saveProduct(editId = null) {
-  const title = document.getElementById('prod-title')?.value?.trim();
-  const desc = document.getElementById('prod-desc')?.value?.trim();
-  const price = parseFloat(document.getElementById('prod-price')?.value);
-  const origPrice = parseFloat(document.getElementById('prod-orig')?.value) || null;
-  const stock = parseInt(document.getElementById('prod-stock')?.value) || 0;
-  const category = document.getElementById('prod-cat')?.value;
-  const imageUrls = (document.getElementById('prod-images')?.value || '').split('\n').filter(u => u.trim());
-  const allImages = [...uploadedImages, ...imageUrls].filter(Boolean);
-
-  if (!title || !desc || !price || !category) { toast('Preencha os campos obrigatórios', 'error'); return; }
-  if (uploadedImages.some(u => u.startsWith('data:'))) {
-    toast('⏳ Aguarde o upload das imagens terminar antes de salvar.', 'error');
-    return;
-  }
-
-  const products = DB.getProducts();
-  if (editId) {
-    const idx = products.findIndex(p => p.id === editId);
-    if (idx >= 0) {
-      products[idx] = { ...products[idx], title, description: desc, price, originalPrice: origPrice, stock, category, images: allImages.length > 0 ? allImages : products[idx].images };
-      DB.setProducts(products);
-      toast('Produto atualizado!', 'success');
+// ===== ADMIN USERS =====
+function renderUsers(el) {
+  if (!state.user || !state.user.isAdmin) { go('home'); return; }
+  api('GET', '/users').then(function(data) {
+    var users = (data.users || []).filter(function(u) { return !u.isAdmin; });
+    var h = '<div class="container" style="padding-top:20px">';
+    h += '<h2 class="section-title">GERENCIAR USUÁRIOS</h2>';
+    h += '<p style="color:var(--text3);margin-bottom:16px">Promova ou rebaixe vendedores</p>';
+    h += '<div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r2);overflow:hidden">';
+    if (users.length === 0) h += '<div class="empty"><div class="empty-icon">👥</div><h3>Nenhum usuário</h3></div>';
+    else for (var i = 0; i < users.length; i++) {
+      var u = users[i];
+      h += '<div class="user-row"><img src="' + u.avatar + '" onerror="this.src=\'https://api.dicebear.com/7.x/initials/svg?seed=' + u.username + '\'">';
+      h += '<div class="user-row-name"><div style="font-weight:600">' + u.username + '</div><div style="font-size:11px;color:var(--text3)">' + (u.email || '') + '</div></div>';
+      h += '<span class="role-badge ' + (u.isSeller ? 'seller' : '') + '">' + (u.isSeller ? 'Vendedor' : 'Comprador') + '</span>';
+      h += '<button class="btn btn-outline btn-sm" onclick="promote(\'' + u.id + '\',' + (!u.isSeller) + ')">' + (u.isSeller ? 'Rebaixar' : 'Promover') + '</button></div>';
     }
-  } else {
-    products.push({ id: uid(), sellerId: state.user.id, title, description: desc, price, originalPrice: origPrice, stock, category, images: allImages.length > 0 ? allImages : [`https://via.placeholder.com/400x400/111111/444444?text=${encodeURIComponent(title)}`], sold: 0, createdAt: new Date().toISOString() });
-    DB.setProducts(products);
-    toast('Produto publicado!', 'success');
-  }
-  uploadedImages = [];
-  navigate('seller-products');
+    h += '</div></div>';
+    el.innerHTML = h;
+  });
+}
+function promote(id, val) {
+  api('POST', '/promote', { targetUserId: id, promote: val }).then(function(d) {
+    if (d.success) { toast(val ? 'Promovido!' : 'Rebaixado!', 'success'); render(); }
+  });
 }
 
-function renderEditProduct() {
-  if (!state.user?.isSeller) { navigate('home'); return ''; }
-  const p = DB.getProducts().find(p => p.id === state.params.id);
-  if (!p) return `<div class="page-container"><div class="empty-state"><h3>Produto não encontrado</h3></div></div>`;
-
-  return `
-    <div class="page-container" style="padding-top:24px;max-width:680px;margin:0 auto">
-      <button class="btn btn-outline btn-sm" style="margin-bottom:20px" onclick="history.back()">← Voltar</button>
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:20px">EDITAR PRODUTO</h2>
-      <div class="form-group"><label>Título *</label><input class="form-control" id="prod-title" value="${p.title}"></div>
-      <div class="form-group"><label>Descrição *</label><textarea class="form-control" id="prod-desc" style="min-height:100px">${p.description}</textarea></div>
-      <div class="two-col">
-        <div class="form-group"><label>Preço *</label><input class="form-control" id="prod-price" type="number" step="0.01" value="${p.price}" inputmode="decimal"></div>
-        <div class="form-group"><label>Original</label><input class="form-control" id="prod-orig" type="number" step="0.01" value="${p.originalPrice || ''}" inputmode="decimal"></div>
-      </div>
-      <div class="two-col">
-        <div class="form-group"><label>Estoque *</label><input class="form-control" id="prod-stock" type="number" value="${p.stock}" inputmode="numeric"></div>
-        <div class="form-group"><label>Categoria *</label>
-          <select class="form-control" id="prod-cat">
-            ${['moda','eletronicos','acessorios','bolsas','beleza','casa','esporte'].map(c => `<option value="${c}" ${p.category===c?'selected':''}>${c}</option>`).join('')}
-          </select>
-        </div>
-      </div>
-      <div class="form-group">
-        <label>Imagens (URLs)</label>
-        <textarea class="form-control" id="prod-images" style="min-height:70px">${p.images.filter(i => i.startsWith('http')).join('\n')}</textarea>
-      </div>
-      <div class="form-group">
-        <label>Upload</label>
-        <label class="btn btn-outline" for="prod-img-upload" style="cursor:pointer;display:inline-flex">📎 Selecionar</label>
-        <input type="file" id="prod-img-upload" accept="image/*" multiple onchange="handleImageUpload(event)">
-        <div class="img-preview-grid" id="img-previews">
-          ${p.images.map(img => `<img class="img-preview" src="${img}" onerror="this.style.display='none'">`).join('')}
-        </div>
-      </div>
-      <button class="btn btn-primary btn-full" onclick="saveProduct('${p.id}')">Salvar alterações</button>
-    </div>
-  `;
+// ===== ORDERS =====
+function renderOrders(el) {
+  if (!state.user) { showLogin(); return; }
+  api('GET', '/orders?buyerId=' + state.user.id).then(function(data) {
+    var orders = data.orders || [];
+    var h = '<div class="container" style="padding-top:20px">';
+    h += '<h2 class="section-title">MEUS PEDIDOS</h2>';
+    if (orders.length === 0) h += '<div class="empty"><div class="empty-icon">📦</div><h3>Nenhum pedido</h3></div>';
+    else for (var i = 0; i < orders.length; i++) {
+      var o = orders[i];
+      h += '<div class="list-item" onclick="go(\'tracking\',{id:\'' + o.id + '\'})"><div class="list-item-info"><div class="list-item-title">Pedido ' + o.id.slice(0, 8) + '</div><div class="list-item-sub">' + timeAgo(o.createdAt) + '</div><div class="list-item-price">' + fmt(o.total) + '</div></div><div style="font-size:12px;color:var(--text2)">' + o.status + '</div></div>';
+    }
+    h += '</div>';
+    el.innerHTML = h;
+  });
 }
 
-// ─── SELLER COUPONS ───────────────────────────────────────────
-function renderSellerCoupons() {
-  if (!state.user?.isSeller) { navigate('home'); return ''; }
-  const coupons = DB.getCoupons().filter(c => c.sellerId === state.user.id);
-
-  return `
-    <div class="page-container" style="padding-top:24px">
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:20px">CUPONS</h2>
-      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius2);padding:20px;margin-bottom:24px;max-width:480px">
-        <h3 style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;margin-bottom:16px">CRIAR CUPOM</h3>
-        <div class="form-group"><label>Código *</label><input class="form-control" id="coupon-code" placeholder="DESCONTO10" style="text-transform:uppercase"></div>
-        <div class="two-col">
-          <div class="form-group"><label>Desconto (%) *</label><input class="form-control" id="coupon-discount" type="number" min="1" max="100" inputmode="numeric"></div>
-          <div class="form-group"><label>Usos máximos *</label><input class="form-control" id="coupon-uses" type="number" min="1" inputmode="numeric"></div>
-        </div>
-        <div class="form-group"><label>Descrição</label><input class="form-control" id="coupon-desc" placeholder="Ex: 10% na primeira compra"></div>
-        <button class="btn btn-primary btn-full" onclick="createCoupon()">Criar cupom</button>
-      </div>
-
-      ${coupons.length === 0 ? `<div class="empty-state"><div class="icon">🏷</div><h3>Nenhum cupom criado</h3></div>` :
-        coupons.map(c => `
-          <div class="coupon-card">
-            <div>
-              <div class="coupon-code">${c.code}</div>
-              <div class="coupon-info">${c.description || ''} • ${c.uses}/${c.maxUses} usos</div>
-            </div>
-            <div class="coupon-discount">${c.discount}%</div>
-            <div style="display:flex;flex-direction:column;gap:5px">
-              <span class="chip" style="${c.active ? 'color:var(--success);border-color:rgba(68,255,136,0.3)' : 'color:var(--danger);border-color:rgba(255,68,68,0.3)'}">${c.active ? 'Ativo' : 'Inativo'}</span>
-              <button class="btn btn-outline btn-sm" onclick="toggleCoupon('${c.id}')">${c.active ? 'Desativar' : 'Ativar'}</button>
-              <button class="btn btn-sm" style="background:none;border:1px solid var(--danger);color:var(--danger)" onclick="deleteCoupon('${c.id}')">Excluir</button>
-            </div>
-          </div>
-        `).join('')
+// ===== TRACKING =====
+function renderTracking(el) {
+  Promise.all([api('GET', '/orders'), api('GET', '/products')]).then(function(r) {
+    var order = (r[0].orders || []).find(function(o) { return o.id === state.params.id; });
+    if (!order) { el.innerHTML = '<div class="container"><h2>Pedido não encontrado</h2></div>'; return; }
+    var product = (r[1].products || []).find(function(p) { return p.id === order.productId; });
+    var isSeller = state.user && state.user.id === order.sellerId;
+    var h = '<div class="container" style="padding-top:20px;max-width:700px;margin:0 auto">';
+    h += '<button class="btn btn-outline btn-sm" style="margin-bottom:16px" onclick="history.back()">← Voltar</button>';
+    h += '<div class="panel"><div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">';
+    if (product) h += '<img src="' + (product.images[0] || '') + '" style="width:50px;height:50px;object-fit:cover;border-radius:8px;border:1px solid var(--border)" onerror="this.style.display=\'none\'">';
+    h += '<div style="flex:1"><div style="font-weight:700">' + (product ? product.title : 'Produto') + '</div><div style="font-size:12px;color:var(--text2);margin-top:2px">' + order.status + '</div></div>';
+    h += '<div style="font-family:\'Space Mono\',monospace;font-size:18px;font-weight:700">' + fmt(order.total) + '</div></div></div>';
+    h += '<div class="panel"><h3 style="font-size:14px;font-weight:700;margin-bottom:12px">📍 ENDEREÇO</h3>';
+    h += '<p style="font-size:13px;color:var(--text2)">' + (order.address.name || '-') + ' · ' + (order.address.phone || '') + '</p>';
+    h += '<p style="font-size:13px;color:var(--text2)">' + (order.address.street || '') + ' ' + (order.address.num || '') + '</p>';
+    h += '<p style="font-size:13px;color:var(--text2)">' + (order.address.city || '') + ' - ' + (order.address.state || '') + '</p></div>';
+    h += '<div class="panel"><h3 style="font-size:14px;font-weight:700;margin-bottom:16px">📦 RASTREAMENTO</h3>';
+    if (order.tracking.length === 0) h += '<p style="color:var(--text3)">Sem atualizações</p>';
+    else {
+      h += '<div class="track-steps">';
+      for (var i = 0; i < order.tracking.length; i++) {
+        var t = order.tracking[i];
+        h += '<div class="track-step"><div class="track-dot"></div><div><div style="font-weight:600;font-size:13px">' + t.status + '</div><div style="font-size:11px;color:var(--text3)">' + t.location + ' · ' + timeAgo(t.date) + '</div></div></div>';
       }
-    </div>
-  `;
+      h += '</div>';
+    }
+    if (isSeller) {
+      h += '<div class="divider"></div><h3 style="font-size:14px;font-weight:700;margin-bottom:12px">ATUALIZAR</h3>';
+      h += '<div class="form-group"><label>Status</label><select class="form-control" id="t-status"><option value="processing">Processando</option><option value="shipped">Enviado</option><option value="delivered">Entregue</option></select></div>';
+      h += '<div class="form-group"><label>Local</label><input class="form-control" id="t-loc" placeholder="Centro de Triagem SP"></div>';
+      h += '<div class="form-group"><label>Descrição</label><input class="form-control" id="t-desc" placeholder="Saiu para entrega"></div>';
+      h += '<button class="btn btn-primary btn-full" onclick="updTrack(\'' + order.id + '\')">Atualizar</button>';
+    }
+    h += '</div></div>';
+    el.innerHTML = h;
+  });
+}
+function updTrack(orderId) {
+  var status = document.getElementById('t-status').value;
+  var loc = document.getElementById('t-loc').value.trim() || '-';
+  var desc = document.getElementById('t-desc').value.trim() || status;
+  api('GET', '/orders').then(function(data) {
+    var order = (data.orders || []).find(function(o) { return o.id === orderId; });
+    if (!order) return;
+    order.tracking.push({ status: desc, date: new Date().toISOString(), location: loc });
+    api('POST', '/order/update-tracking', { id: orderId, status: status, tracking: order.tracking }).then(function() {
+      api('POST', '/notifications/create', { id: uid(), userId: order.buyerId, type: 'tracking', message: 'Pedido: ' + desc + ' - ' + loc, orderId: orderId });
+      toast('Atualizado!', 'success');
+      render();
+    });
+  });
 }
 
-function createCoupon() {
-  const code = document.getElementById('coupon-code')?.value?.trim().toUpperCase();
-  const discount = parseInt(document.getElementById('coupon-discount')?.value);
-  const maxUses = parseInt(document.getElementById('coupon-uses')?.value);
-  const description = document.getElementById('coupon-desc')?.value?.trim();
-  if (!code || !discount || !maxUses) { toast('Preencha todos os campos', 'error'); return; }
-  if (discount < 1 || discount > 100) { toast('Desconto deve ser entre 1% e 100%', 'error'); return; }
-  const coupons = DB.getCoupons();
-  if (coupons.find(c => c.code === code && c.sellerId === state.user.id)) { toast('Código já existe', 'error'); return; }
-  coupons.push({ id: uid(), sellerId: state.user.id, code, discount, maxUses, uses: 0, description, active: true, createdAt: new Date().toISOString() });
-  DB.setCoupons(coupons);
-  toast(`Cupom ${code} criado!`, 'success');
+// ===== NOTIFICATIONS =====
+function renderNotifs(el) {
+  if (!state.user) { showLogin(); return; }
+  api('GET', '/notifications?userId=' + state.user.id).then(function(data) {
+    var notifs = data.notifs || [];
+    var h = '<div class="container" style="padding-top:20px;max-width:700px;margin:0 auto">';
+    h += '<h2 class="section-title">NOTIFICAÇÕES</h2>';
+    h += '<div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r2);overflow:hidden">';
+    if (notifs.length === 0) h += '<div class="empty"><div class="empty-icon">🔔</div><h3>Nenhuma notificação</h3></div>';
+    else for (var i = 0; i < notifs.length; i++) {
+      var n = notifs[i];
+      var oc = n.orderId ? 'go(\'tracking\',{id:\'' + n.orderId + '\'})' : '';
+      h += '<div class="notif-item" onclick="' + oc + '"><div class="notif-dot ' + (n.read ? '' : 'unread') + '"></div><div><div style="font-size:13px">' + n.message + '</div><div style="font-size:11px;color:var(--text3);margin-top:4px">' + timeAgo(n.createdAt) + '</div></div></div>';
+    }
+    h += '</div></div>';
+    el.innerHTML = h;
+  });
+}
+
+// ===== CHAT =====
+function renderChat(el) {
+  var h = '<div class="container" style="padding-top:20px;max-width:700px;margin:0 auto">';
+  h += '<button class="btn btn-outline btn-sm" style="margin-bottom:16px" onclick="history.back()">← Voltar</button>';
+  h += '<h2 class="section-title">CHAT</h2>';
+  h += '<div class="chat-box"><div class="chat-msgs" id="chat-msgs"><div class="empty"><div class="empty-icon">💬</div><h3>Aguardando...</h3></div></div>';
+  h += '<div class="chat-input-row"><input class="form-control" id="chat-in" placeholder="Mensagem..." onkeydown="if(event.key===\'Enter\')sendMsg()"><button class="btn btn-primary" onclick="sendMsg()">→</button></div></div>';
+  h += '</div>';
+  el.innerHTML = h;
+}
+var currentRoom = null;
+function renderChatRoom(roomId, messages) {
+  currentRoom = roomId;
+  var c = document.getElementById('chat-msgs');
+  if (!c) return;
+  var h = '';
+  for (var i = 0; i < messages.length; i++) {
+    var m = messages[i];
+    var mine = state.user && m.senderId === state.user.id;
+    var sys = m.senderId === '__system__';
+    if (sys) { h += '<div style="text-align:center;font-size:12px;color:var(--text3);margin:10px 0">' + m.text + '</div>'; continue; }
+    h += '<div class="chat-msg ' + (mine ? 'right' : 'left') + '"><div class="chat-bubble">' + m.text + '</div><div class="chat-time">' + timeAgo(m.createdAt) + '</div></div>';
+  }
+  c.innerHTML = h;
+  c.scrollTop = c.scrollHeight;
+}
+function appendChatMsg(msg) {
+  var c = document.getElementById('chat-msgs');
+  if (!c) return;
+  var mine = state.user && msg.senderId === state.user.id;
+  var div = document.createElement('div');
+  div.className = 'chat-msg ' + (mine ? 'right' : 'left');
+  div.innerHTML = '<div class="chat-bubble">' + msg.text + '</div><div class="chat-time">' + timeAgo(msg.createdAt) + '</div>';
+  c.appendChild(div);
+  c.scrollTop = c.scrollHeight;
+}
+function sendMsg() {
+  var input = document.getElementById('chat-in');
+  var text = input.value.trim();
+  if (!text || !currentRoom) return;
+  wsSend({ type: 'chat_message', roomId: currentRoom, senderId: state.user.id, text: text });
+  input.value = '';
+}
+
+// ===== INIT =====
+function init() {
+  var saved = localStorage.getItem('astore_user');
+  if (saved) { try { state.user = JSON.parse(saved); } catch(e) {} }
+  
+  document.getElementById('user-btn').addEventListener('click', toggleMenu);
+  
+  connectWS();
   render();
+  updateBtn();
 }
 
-function toggleCoupon(id) {
-  const coupons = DB.getCoupons();
-  const idx = coupons.findIndex(c => c.id === id);
-  if (idx >= 0) { coupons[idx].active = !coupons[idx].active; DB.setCoupons(coupons); render(); }
-}
-
-function deleteCoupon(id) {
-  if (!confirm('Excluir este cupom?')) return;
-  DB.setCoupons(DB.getCoupons().filter(c => c.id !== id));
-  toast('Cupom excluído', 'info');
-  render();
-}
-
-// ─── ADMIN: USER MANAGEMENT ───────────────────────────────────
-function renderAdminUsers() {
-  if (!state.user?.isAdmin) { toast('Acesso restrito', 'error'); navigate('home'); return ''; }
-  // Request fresh user list from server — server will respond with users_list
-  // which updates the DOM via renderAdminUsersHTML() without causing a loop
-  WS.send({ type: 'get_users' });
-  return renderAdminUsersHTML();
-}
-
-function renderAdminUsersHTML() {
-  if (!state.user?.isAdmin) return '';
-  const users = DB.getUsers().filter(u => !u.isAdmin);
-  return `
-    <div class="page-container" style="padding-top:24px">
-      <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;margin-bottom:6px">USUÁRIOS</h2>
-      <p style="color:var(--text3);margin-bottom:20px">Lista de usuários cadastrados</p>
-      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius2);overflow:hidden">
-        ${users.length === 0 ? `<div class="empty-state"><div class="icon">👥</div><h3>Nenhum usuário</h3></div>` :
-          users.map(u => `
-            <div class="user-row">
-              <img class="user-row-avatar" src="${u.avatar}" alt="${u.username}" onerror="this.src='https://api.dicebear.com/7.x/initials/svg?seed=${u.username}'">
-              <div class="user-row-name">
-                <div style="font-weight:600">${u.username}</div>
-                <div style="font-size:11px;color:var(--text3)">${u.email || ''}</div>
-              </div>
-              <span class="role-badge ${u.isSeller ? 'seller' : ''}">${u.isSeller ? 'Vendedor' : 'Comprador'}</span>
-            </div>
-          `).join('')
-        }
-      </div>
-    </div>
-  `;
-}
-
-// ─── BOOT ────────────────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', init);
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+else init();
