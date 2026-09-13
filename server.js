@@ -467,6 +467,40 @@ var server = http.createServer(function(req, res) {
     return;
   }
 
+  // ---------- CHAT ROOMS LIST ----------
+if (req.method === 'GET' && u === '/api/chat/rooms') {
+  var userId = new URL(req.url, 'http://x').searchParams.get('userId');
+  if (!userId) return json(res, { rooms: [] });
+  pool.query('SELECT * FROM chat_rooms ORDER BY createdAt DESC')
+    .then(async function(r) {
+      var mine = r.rows.filter(function(room) {
+        try { return JSON.parse(room.participants).indexOf(userId) !== -1; } catch(e) { return false; }
+      });
+      var result = [];
+      for (var i = 0; i < mine.length; i++) {
+        var room = mine[i];
+        var parts = JSON.parse(room.participants);
+        var otherId = parts.find(function(p) { return p !== userId; });
+        if (!otherId) continue;
+        var otherR = await pool.query('SELECT id,username,avatar FROM users WHERE id=$1', [otherId]);
+        if (!otherR.rows.length) continue;
+        var other = otherR.rows[0];
+        var lastR = await pool.query('SELECT text,createdAt FROM chat_messages WHERE roomId=$1 ORDER BY createdAt DESC LIMIT 1', [room.id]);
+        result.push({
+          roomId: room.id,
+          otherId: other.id,
+          otherName: other.username,
+          otherAvatar: other.avatar,
+          lastMessage: lastR.rows[0]?.text || '',
+          lastDate: lastR.rows[0]?.createdat || room.createdat
+        });
+      }
+      json(res, { rooms: result });
+    })
+    .catch(function(e) { json(res, { error: e.message }, 500); });
+  return;
+}
+  
   // ---------- NOTIFS ----------
   if (req.method === 'GET' && u === '/api/notifications') {
     var uid2 = new URL(req.url, 'http://x').searchParams.get('userId');
