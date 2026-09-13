@@ -1,12 +1,13 @@
 {
-  "name": "astore",
-  "version": "1.0.0",
+  "name": "redzin-market",
+  "version": "3.0.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "better-sqlite3": "^9.6.0",
-    "ws": "^8.17.0"
+    "pg": "^8.12.0",
+    "ws": "^8.17.0",
+    "mercadopago": "^2.0.15"
   }
 }
